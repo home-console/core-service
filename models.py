@@ -41,3 +41,17 @@ class Enrollment(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
+class TerminalAudit(Base):
+    __tablename__ = "terminal_audit"
+    id = Column(String(128), primary_key=True)
+    session_id = Column(String(128), index=True, nullable=False)
+    client_id = Column(String(128), index=True, nullable=True)
+    initiator_type = Column(String(32), nullable=True)
+    initiator_id = Column(String(128), nullable=True)
+    record_path = Column(Text, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    stopped_at = Column(DateTime, nullable=True)
+    exit_code = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+

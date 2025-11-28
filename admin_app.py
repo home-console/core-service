@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from sqladmin import Admin, ModelView
 
 from .db import engine, get_session
-from .models import Base, Client, CommandLog, Enrollment
+from .models import Base, Client, CommandLog, Enrollment, TerminalAudit
 import random
 import string
 
@@ -680,5 +680,63 @@ def create_admin_app(orchestrator) -> FastAPI:
           pass
 
     return app
+
+
+    # --- Terminal audit endpoint ---
+    @app.post("/api/terminals/audit")
+    async def terminal_audit(payload: Dict[str, Any]):
+      """Create or update a terminal audit entry.
+
+      Payload example:
+      {"session_id": "...", "client_id": "...", "initiator": {"type":"user","id":"alice"}, "event": "started", "ts": 1234567890, "record_path": "/tmp/terminals/...", "exit_code": 0}
+      """
+      from datetime import datetime
+      sid = payload.get("session_id")
+      if not sid:
+        raise HTTPException(status_code=400, detail="session_id required")
+
+      event = payload.get("event")
+      ts = payload.get("ts")
+      if ts:
+        try:
+          ts_val = datetime.fromtimestamp(float(ts))
+        except Exception:
+          ts_val = None
+      else:
+        ts_val = datetime.utcnow()
+
+      with get_session() as db:
+        # Try to find existing audit by session_id
+        from sqlalchemy import select
+        q = select(TerminalAudit).where(TerminalAudit.session_id == sid)
+        res = db.execute(q).scalars().first()
+        if res is None:
+          # create new
+          import uuid
+          aid = payload.get("id") or f"term_{uuid.uuid4().hex}"
+          rec = TerminalAudit(id=aid, session_id=sid, client_id=payload.get("client_id"),
+                    initiator_type=(payload.get("initiator") or {}).get("type"),
+                    initiator_id=(payload.get("initiator") or {}).get("id"),
+                    record_path=payload.get("record_path"),
+                    started_at=ts_val if event == "started" else None,
+                    stopped_at=ts_val if event == "stopped" else None,
+                    exit_code=payload.get("exit_code"))
+          db.merge(rec)
+        else:
+          # update existing
+          if event == "started":
+            res.started_at = ts_val
+          if event == "stopped":
+            res.stopped_at = ts_val
+            res.exit_code = payload.get("exit_code")
+          if payload.get("record_path"):
+            res.record_path = payload.get("record_path")
+          # update initiator if present
+          if payload.get("initiator"):
+            res.initiator_type = (payload.get("initiator") or {}).get("type")
+            res.initiator_id = (payload.get("initiator") or {}).get("id")
+          db.add(res)
+
+      return JSONResponse({"status": "ok"})
 
 
