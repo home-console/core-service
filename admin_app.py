@@ -5,7 +5,7 @@ import json
 from urllib.parse import urlencode
 
 import http.client
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -364,6 +364,106 @@ def create_admin_app(orchestrator) -> FastAPI:
     async def command_exec_compat(client_id: str, payload: Dict[str, Any]) -> JSONResponse:
         return await command_exec(client_id, payload)
 
+    # --- Files proxy: upload from browser -> server -> client
+    from fastapi import UploadFile, File, Form
+
+    @app.post("/api/files/upload")
+    async def upload_file_from_browser(
+      client_id: str = Form(...),
+      dest_path: str = Form(...),
+      file: UploadFile = File(...),
+    ) -> JSONResponse:
+      """Принимает multipart/form-data файл, сохраняет временно на сервере и инициирует upload в client_manager"""
+      import tempfile, os
+      if not client_id or not dest_path:
+        raise HTTPException(status_code=400, detail="client_id и dest_path обязательны")
+
+      # Сохраняем входящий файл в /tmp
+      try:
+        original_name = file.filename
+        fd, tmp_path = tempfile.mkstemp(prefix='upload_', suffix='')
+        os.close(fd)
+        total_written = 0
+        with open(tmp_path, 'wb') as f:
+          while True:
+            chunk = await file.read(1024 * 64)
+            if not chunk:
+              break
+            f.write(chunk)
+            total_written += len(chunk)
+        await file.close()
+      except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Не удалось сохранить файл: {e}")
+
+      # Инициализируем трансфер на client_manager
+      body = {
+        "client_id": client_id,
+        "path": dest_path,
+        "source_path_server": tmp_path,
+        "direction": "upload",
+        "size": total_written,
+        "original_filename": original_name,
+      }
+      try:
+        data = await asyncio.to_thread(_http_json, "POST", "/api/files/upload/init", body=body)
+      except HTTPException as he:
+        # попытка удалить временный файл
+        try:
+          os.remove(tmp_path)
+        except Exception:
+          pass
+        raise he
+
+      return JSONResponse(data)
+
+    @app.post("/api/files/upload/init")
+    async def upload_init_proxy(request: Request):
+      """Proxy/compat endpoint: принимает либо multipart/form-data (тот же формат, что /api/files/upload),
+      либо JSON body и переадресует/обрабатывает запрос для client_manager `/api/files/upload/init`.
+      """
+      content_type = request.headers.get('content-type', '')
+      # Если multipart — повторно используем логику upload_file_from_browser
+      if content_type.startswith('multipart/form-data'):
+        form = await request.form()
+        client_id = form.get('client_id')
+        dest_path = form.get('path') or form.get('dest_path')
+        upload_file = form.get('file')
+        if not client_id or not dest_path or not upload_file:
+          raise HTTPException(status_code=400, detail='client_id, path и file обязательны для multipart upload')
+        # Вызовем internal handler который сохраняет и вызывает client_manager
+        return await upload_file_from_browser(client_id=client_id, dest_path=dest_path, file=upload_file)
+
+      # Иначе ожидаем JSON и проксируем тело в client_manager
+      try:
+        body = await request.json()
+      except Exception:
+        raise HTTPException(status_code=400, detail='Invalid request body')
+      try:
+        data = await asyncio.to_thread(_http_json, 'POST', '/api/files/upload/init', body)
+        return JSONResponse(data)
+      except HTTPException as he:
+        raise he
+
+    @app.get("/api/files/transfers/{transfer_id}/status")
+    async def transfer_status_proxy(transfer_id: str) -> JSONResponse:
+      data = await asyncio.to_thread(_http_json, "GET", f"/api/files/transfers/{transfer_id}/status")
+      return JSONResponse(data)
+
+    @app.post("/api/files/transfers/pause")
+    async def transfer_pause_proxy(payload: Dict[str, Any]) -> JSONResponse:
+      data = await asyncio.to_thread(_http_json, "POST", "/api/files/transfers/pause", body=payload)
+      return JSONResponse(data)
+
+    @app.post("/api/files/transfers/resume")
+    async def transfer_resume_proxy(payload: Dict[str, Any]) -> JSONResponse:
+      data = await asyncio.to_thread(_http_json, "POST", "/api/files/transfers/resume", body=payload)
+      return JSONResponse(data)
+
+    @app.post("/api/files/transfers/cancel")
+    async def transfer_cancel_proxy(payload: Dict[str, Any]) -> JSONResponse:
+      data = await asyncio.to_thread(_http_json, "POST", "/api/files/transfers/cancel", body=payload)
+      return JSONResponse(data)
+
     @app.post("/api/commands/{client_id}/cancel")
     async def command_cancel(client_id: str, command_id: str) -> JSONResponse:
         # оригинальный endpoint ожидает body или query? используем query для простоты
@@ -415,6 +515,53 @@ def create_admin_app(orchestrator) -> FastAPI:
     async def command_result(command_id: str) -> JSONResponse:
         data = await asyncio.to_thread(_http_json, "GET", f"/api/commands/{command_id}")
         return JSONResponse(data)
+
+    # --- Download helpers: initiate download from client and proxy the file
+    from fastapi import Form
+
+    @app.post("/api/files/download")
+    async def initiate_download(client_id: str = Form(...), path: str = Form(...)) -> JSONResponse:
+      """Инициировать скачивание файла с клиента; core_service вызывает client_manager и вернёт transfer_id"""
+      body = {"client_id": client_id, "path": path, "direction": "download"}
+      data = await asyncio.to_thread(_http_json, "POST", "/api/files/upload/init", body=body)
+      return JSONResponse(data)
+
+    @app.get("/api/files/download/{transfer_id}")
+    async def proxy_download(transfer_id: str):
+      """Проксируем запрос скачивания файла от client_manager и стримим его клиенту."""
+      # Запросим файл у client_manager
+      import http.client, ssl
+      base = os.getenv("CM_BASE_URL", "http://127.0.0.1:10000")
+      from urllib.parse import urlparse as _parse
+      b = _parse(base)
+      scheme = (b.scheme or "http").lower()
+      host = b.hostname or "127.0.0.1"
+      port = b.port or (443 if scheme == "https" else 80)
+      path = f"/api/files/transfers/{transfer_id}/download"
+      if scheme == "https":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(host, port, timeout=30, context=ctx)
+      else:
+        conn = http.client.HTTPConnection(host, port, timeout=30)
+      try:
+        conn.request('GET', path)
+        resp = conn.getresponse()
+        data = resp.read()
+        if resp.status != 200:
+          text = data.decode('utf-8', errors='ignore')
+          raise HTTPException(status_code=resp.status, detail=text)
+        from fastapi.responses import StreamingResponse
+        def stream():
+          yield data
+        headers = {k: v for k, v in resp.getheaders()}
+        return StreamingResponse(stream(), media_type=headers.get('Content-Type', 'application/octet-stream'), headers={})
+      finally:
+        try:
+          conn.close()
+        except Exception:
+          pass
 
     return app
 
