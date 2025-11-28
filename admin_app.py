@@ -15,6 +15,8 @@ from sqladmin import Admin, ModelView
 
 from .db import engine, get_session
 from .models import Base, Client, CommandLog, Enrollment
+import random
+import string
 
 
 def _http_json(method: str, url: str, body: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 15.0) -> Any:
@@ -44,6 +46,60 @@ def _http_json(method: str, url: str, body: Dict[str, Any] | None = None, header
         if body is not None:
             payload = json.dumps(body)
         conn.request(method.upper(), path, body=payload, headers=hdrs)
+        resp = conn.getresponse()
+        data = resp.read()
+        text = data.decode("utf-8") if data else ""
+        if 200 <= resp.status < 300:
+            return json.loads(text) if text else None
+        raise HTTPException(status_code=resp.status, detail=text or "Upstream error")
+    except (TimeoutError, ConnectionError, OSError) as e:
+        raise HTTPException(status_code=503, detail=f"Client manager unavailable: {str(e)}")
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
+def _http_multipart(path: str, fields: Dict[str, str], file_field: str, filename: str, file_bytes: bytes, file_content_type: str = "application/octet-stream", timeout: float = 30.0) -> Any:
+    """Send a multipart/form-data POST to the configured client_manager base url.
+    This is a minimal implementation suitable for small-to-medium files in dev.
+    """
+    base = os.getenv("CM_BASE_URL", "http://127.0.0.1:10000")
+    from urllib.parse import urlparse as _parse
+    b = _parse(base)
+    scheme = (b.scheme or "http").lower()
+    host = b.hostname or "127.0.0.1"
+    port = b.port or (443 if scheme == "https" else 80)
+    if not path.startswith("/"):
+        path = "/" + path
+
+    boundary = "----boundary" + ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
+    crlf = "\r\n"
+    body_parts = []
+    for k, v in (fields or {}).items():
+      # Do not include a trailing CRLF after the value — the join will
+      # insert separators and we will append separators around the file part.
+      body_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{k}\"{crlf}{crlf}{v}")
+
+    # file part (headers end with two CRLFs, file bytes follow immediately)
+    body_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"{crlf}Content-Type: {file_content_type}{crlf}{crlf}")
+
+    # Join parts with CRLF, then append file bytes, a CRLF and the final boundary.
+    body_bytes = crlf.join(body_parts).encode("utf-8") + file_bytes + crlf.encode("utf-8") + f"--{boundary}--{crlf}".encode("utf-8")
+
+    hdrs = {"Content-Type": f"multipart/form-data; boundary={boundary}", "Content-Length": str(len(body_bytes))}
+
+    if scheme == "https":
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+
+    try:
+        conn.request('POST', path, body=body_bytes, headers=hdrs)
         resp = conn.getresponse()
         data = resp.read()
         text = data.decode("utf-8") if data else ""
@@ -373,48 +429,32 @@ def create_admin_app(orchestrator) -> FastAPI:
       dest_path: str = Form(...),
       file: UploadFile = File(...),
     ) -> JSONResponse:
-      """Принимает multipart/form-data файл, сохраняет временно на сервере и инициирует upload в client_manager"""
-      import tempfile, os
-      if not client_id or not dest_path:
-        raise HTTPException(status_code=400, detail="client_id и dest_path обязательны")
+        """Принимает multipart/form-data файл и проксирует его в client_manager.
+        Считывает файл в память (подходит для небольших файлов в dev).
+        """
+        if not client_id or not dest_path:
+            raise HTTPException(status_code=400, detail="client_id и dest_path обязательны")
 
-      # Сохраняем входящий файл в /tmp
-      try:
-        original_name = file.filename
-        fd, tmp_path = tempfile.mkstemp(prefix='upload_', suffix='')
-        os.close(fd)
-        total_written = 0
-        with open(tmp_path, 'wb') as f:
-          while True:
-            chunk = await file.read(1024 * 64)
-            if not chunk:
-              break
-            f.write(chunk)
-            total_written += len(chunk)
-        await file.close()
-      except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Не удалось сохранить файл: {e}")
-
-      # Инициализируем трансфер на client_manager
-      body = {
-        "client_id": client_id,
-        "path": dest_path,
-        "source_path_server": tmp_path,
-        "direction": "upload",
-        "size": total_written,
-        "original_filename": original_name,
-      }
-      try:
-        data = await asyncio.to_thread(_http_json, "POST", "/api/files/upload/init", body=body)
-      except HTTPException as he:
-        # попытка удалить временный файл
         try:
-          os.remove(tmp_path)
-        except Exception:
-          pass
-        raise he
+            original_name = file.filename
+            # Прочитаем файл в память (подходит для dev/small files). Для больших
+            # файлов можно реализовать стриминг.
+            file_bytes = await file.read()
+            await file.close()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Не удалось прочитать файл: {e}")
 
-      return JSONResponse(data)
+        fields = {
+            "client_id": client_id,
+            "path": dest_path,
+            "original_filename": original_name or "",
+            "direction": "upload",
+        }
+        try:
+            data = await asyncio.to_thread(_http_multipart, "/api/files/upload/init", fields, "file", original_name or "upload.bin", file_bytes)
+            return JSONResponse(data)
+        except HTTPException as he:
+            raise he
 
     @app.post("/api/files/upload/init")
     async def upload_init_proxy(request: Request):
