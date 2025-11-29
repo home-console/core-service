@@ -203,7 +203,20 @@ async def lifespan(app: FastAPI):
 
 def create_admin_app(orchestrator) -> FastAPI:
     app = FastAPI(title="Core Admin Panel", version="1.0.0", lifespan=lifespan)
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    # Безопасная настройка CORS: читаем из окружения CSV-перечисление
+    origins_env = os.getenv("CORS_ALLOW_ORIGINS") or os.getenv("ALLOWED_ORIGINS") or "http://localhost:3000"
+    if origins_env.strip() == "*":
+      allow_origins = ["*"]
+    else:
+      allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+    allow_credentials = False if (len(allow_origins) == 1 and allow_origins[0] == "*") else True
+    app.add_middleware(
+      CORSMiddleware,
+      allow_origins=allow_origins,
+      allow_credentials=allow_credentials,
+      allow_methods=["*"],
+      allow_headers=["*"]
+    )
 
     # SQLAdmin панель на /admin
     admin = Admin(app, engine)

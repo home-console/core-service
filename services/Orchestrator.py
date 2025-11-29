@@ -83,6 +83,16 @@ class Orchestrator:
         if not self._wait_deps(svc):
             print(f"⏳ Зависимости для {svc.name} не готовы, откладываем старт")
             return
+        # Validate command list to avoid accidental shell invocation or injection
+        if not isinstance(svc.command, (list, tuple)) or len(svc.command) == 0:
+            print(f"❌ Invalid command for {svc.name}: expected non-empty list of args")
+            return
+        # ensure none of the args contain shell metacharacters
+        for part in svc.command:
+            if contains_shell_meta(str(part)):
+                print(f"❌ Refusing to start {svc.name}: command argument contains unsafe characters: {part}")
+                return
+
         now = time.time()
         backoff = max(0, svc.restart_backoff_sec - int(now - svc.last_start_ts))
         if backoff:
@@ -103,15 +113,6 @@ class Orchestrator:
         # Потоки логов, чтобы не блокировать stdout/stderr
         threading.Thread(target=self._pipe_output, args=(svc, True), daemon=True).start()
         threading.Thread(target=self._pipe_output, args=(svc, False), daemon=True).start()
-
-    @staticmethod
-    def _pipe_output(svc: ManagedService, is_stdout: bool) -> None:
-        stream = svc.process.stdout if is_stdout else svc.process.stderr
-        prefix = f"[{svc.name}][STDOUT]" if is_stdout else f"[{svc.name}][STDERR]"
-        if stream is None:
-            return
-        for line in iter(stream.readline, ''):
-            print(f"{prefix} {line}", end='')
 
     @staticmethod
     def _http_get_ok(url: str, timeout: float = 3.0) -> bool:
@@ -225,3 +226,8 @@ class Orchestrator:
         self._stop_event.set()
         for svc in list(self.services.values()):
             self._stop_service(svc, graceful=graceful)
+
+
+def contains_shell_meta(s: str) -> bool:
+    """Module-level helper: detect shell metacharacters in a string."""
+    return any(ch in s for ch in [';', '&', '|', '<', '>', '`', '$', '\\'])
