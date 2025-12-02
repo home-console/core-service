@@ -9,11 +9,15 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
 
 # Копируем только зависимости для кеша
-COPY core_service/requirements.txt /app/core_service/requirements.txt
-RUN pip install --no-cache-dir -r /app/core_service/requirements.txt
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Код монтируется томом в dev. На проде можно раскомментировать COPY:
-# COPY core_service /app/core_service
+RUN mkdir -p /app/core_service
+# Копируем весь репозиторий внутрь папки пакета, чтобы запуск через
+# `python -m core_service.main` работал корректно (создаём package)
+COPY . /app/core_service
+RUN if [ ! -f /app/core_service/__init__.py ]; then touch /app/core_service/__init__.py; fi
 
 EXPOSE 11000
 
