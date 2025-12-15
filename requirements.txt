@@ -5,3 +5,5 @@ sqladmin>=0.18.0
 PyJWT>=2.8.0
 cryptography
 
+home-console-sdk
+

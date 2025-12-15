@@ -206,6 +206,37 @@ class EnrollmentAdmin(ModelView, model=Enrollment):
 async def lifespan(app: FastAPI):
     # Создание таблиц на запуске
     Base.metadata.create_all(bind=engine)
+    
+    # Загрузка встраиваемых плагинов (new: Internal Plugins from SDK)
+    try:
+        from plugin_loader import PluginLoader
+        from event_bus import event_bus
+        import asyncio
+        
+        # Используем async session maker для плагинов
+        async def get_async_session_maker():
+            from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+            # Получаем DATABASE_URL из переменных окружения или используем default
+            db_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+            engine = create_async_engine(db_url, echo=False)
+            return async_sessionmaker(engine, expire_on_commit=False)
+        
+        loop = asyncio.get_event_loop()
+        plugin_loader = PluginLoader(app, get_session)  # get_session из db.py
+        await plugin_loader.load_all()
+        
+        # Сохраняем в app state для доступа из endpoints
+        app.state.plugin_loader = plugin_loader
+        app.state.event_bus = event_bus
+        
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"✅ Loaded {len(plugin_loader.plugins)} internal plugins")
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"⚠️ Failed to load internal plugins: {e}")
+    
     yield
 
 
@@ -1264,5 +1295,29 @@ def create_admin_app(orchestrator) -> FastAPI:
           db.add(res)
 
       return JSONResponse({"status": "ok"})
+
+    # ============= INTERNAL PLUGINS API (NEW) =============
+    
+    @app.get("/api/v1/admin/plugins")
+    async def list_plugins():
+        """List all loaded internal plugins."""
+        if not hasattr(app.state, 'plugin_loader'):
+            return {"plugins": [], "message": "Plugin loader not initialized"}
+        return {"plugins": app.state.plugin_loader.list_plugins()}
+    
+    @app.get("/api/v1/admin/stats")
+    async def get_stats():
+        """System statistics."""
+        plugin_count = 0
+        if hasattr(app.state, 'plugin_loader'):
+            plugin_count = len(app.state.plugin_loader.plugins)
+        
+        return {
+            "status": "running",
+            "plugins_loaded": plugin_count,
+            "version": "1.0.0"
+        }
+
+    return app
 
 
