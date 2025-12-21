@@ -1,4 +1,5 @@
 from typing import Any, Dict
+import logging
 import os
 import asyncio
 import json
@@ -18,13 +19,33 @@ from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
 from sqladmin import Admin, ModelView
 
-from .db import engine, get_session
-from .models import Base, Client, CommandLog, Enrollment, TerminalAudit
-from .models import Plugin, PluginVersion, PluginInstallJob
-# Plugin loader (MVP)
-from .plugins.loader import PluginLoader
+try:
+  from .db import engine, get_session
+except Exception:
+  from db import engine, get_session
+
+try:
+  from .models import Base, Client, CommandLog, Enrollment, TerminalAudit
+  from .models import Plugin, PluginVersion, PluginInstallJob
+except Exception:
+  from models import Base, Client, CommandLog, Enrollment, TerminalAudit
+  from models import Plugin, PluginVersion, PluginInstallJob
+try:
+  from .plugin_loader import PluginLoader
+except Exception:
+  from plugin_loader import PluginLoader
+# External plugin registry (HTTP proxy)
+try:
+  from .plugin_registry import external_plugin_registry
+except Exception:
+  from plugin_registry import external_plugin_registry
+# Plugin loader
 import random
 import string
+from .health_monitor import HealthMonitor
+
+# module-level health monitor handle
+_health_monitor = None
 
 
 def _http_json(method: str, url: str, body: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 15.0) -> Any:
@@ -209,8 +230,12 @@ async def lifespan(app: FastAPI):
     
     # Загрузка встраиваемых плагинов (new: Internal Plugins from SDK)
     try:
-        from plugin_loader import PluginLoader
-        from event_bus import event_bus
+        try:
+          from .plugin_loader import PluginLoader
+          from .event_bus import event_bus
+        except Exception:
+          from plugin_loader import PluginLoader
+          from event_bus import event_bus
         import asyncio
         
         # Используем async session maker для плагинов
@@ -232,6 +257,38 @@ async def lifespan(app: FastAPI):
         import logging
         logger = logging.getLogger(__name__)
         logger.info(f"✅ Loaded {len(plugin_loader.plugins)} internal plugins")
+        # Auto-register external plugins from ENV/config if helper exists
+        try:
+          from .admin_app import register_external_plugins_from_env  # type: ignore
+        except Exception:
+          try:
+            from admin_app import register_external_plugins_from_env  # type: ignore
+          except Exception:
+            register_external_plugins_from_env = None
+
+        if callable(register_external_plugins_from_env):
+          try:
+            registered = register_external_plugins_from_env()
+            if asyncio.iscoroutine(registered):
+              registered = await registered
+            logger.info(f"📦 Auto-registered external plugins from ENV: {registered}")
+            # initial health checks
+            try:
+              res = await external_plugin_registry.health_check_all()
+              for pid, ok in res.items():
+                logger.info(f"{'✅' if ok else '❌'} {pid}: {'healthy' if ok else 'unhealthy'}")
+            except Exception:
+              pass
+          except Exception as e:
+            logger.warning(f"Failed to auto-register external plugins: {e}")
+        # Optional: start health monitor if enabled
+        try:
+          if os.getenv('ENABLE_HEALTH_MONITOR', 'false').lower() == 'true':
+            interval = int(os.getenv('HEALTH_CHECK_INTERVAL', '60'))
+            _health_monitor = HealthMonitor(external_plugin_registry, check_interval=interval)
+            await _health_monitor.start()
+        except Exception as e:
+          logger.warning(f"Failed to start health monitor: {e}")
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)
@@ -239,8 +296,18 @@ async def lifespan(app: FastAPI):
     
     yield
 
+    # shutdown cleanup
+    try:
+      if _health_monitor is not None:
+        await _health_monitor.stop()
+    except Exception:
+      pass
+    try:
+      await external_plugin_registry.aclose()
+    except Exception:
+      pass
 
-def create_admin_app(orchestrator) -> FastAPI:
+def create_admin_app() -> FastAPI:
     app = FastAPI(title="Core Admin Panel", version="1.0.0", lifespan=lifespan)
     # Безопасная настройка CORS: читаем из окружения CSV-перечисление
     origins_env = os.getenv("CORS_ALLOW_ORIGINS") or os.getenv("ALLOWED_ORIGINS") or "http://localhost:3000"
@@ -266,9 +333,9 @@ def create_admin_app(orchestrator) -> FastAPI:
     # Initialize plugin loader (scans core_service/plugins directory)
     try:
       plugins_dir = os.path.join(os.path.dirname(__file__), 'plugins')
-      plugin_loader = PluginLoader(plugins_dir)
+      plugin_loader = PluginLoader(app, get_session)
     except Exception:
-      plugin_loader = PluginLoader()
+      plugin_loader = PluginLoader(app, get_session)
 
     @app.get('/api/plugins')
     async def list_plugins():
@@ -292,6 +359,69 @@ def create_admin_app(orchestrator) -> FastAPI:
         data = plugin_loader.list_plugins()
         return {k: dict(v) for k, v in data.items()}
       return result
+
+      # ---------------- External Plugin Proxy & Status ----------------
+      from fastapi import Request as _Request
+      @app.api_route(
+        '/api/plugins/{plugin_id}/{path:path}',
+        methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH']
+      )
+      async def proxy_to_external_plugin(plugin_id: str, path: str, request: _Request):
+        # read body for JSON methods
+        body = None
+        if request.method in ('POST', 'PUT', 'PATCH'):
+          try:
+            body = await request.json()
+          except Exception:
+            body = None
+
+        try:
+          result = await external_plugin_registry.proxy_request(
+            plugin_id=plugin_id,
+            path=path,
+            method=request.method,
+            json=body,
+            params=dict(request.query_params),
+            headers=dict(request.headers)
+          )
+          return result
+        except LookupError:
+          raise HTTPException(status_code=404, detail=f"External plugin '{plugin_id}' not registered")
+        except Exception as e:
+          logger.error(f"Proxy error for {plugin_id}: {e}")
+          raise HTTPException(status_code=502, detail=str(e))
+
+      @app.get('/api/plugins/status')
+      async def get_plugins_status():
+        status = {'internal': {}, 'external': {}}
+        try:
+          if hasattr(app.state, 'plugin_loader'):
+            pl = app.state.plugin_loader
+            for pid, p in pl.plugins.items():
+              status['internal'][pid] = {'name': getattr(p, 'name', pid), 'loaded': True}
+        except Exception:
+          pass
+
+        for pid, plugin in external_plugin_registry.plugins.items():
+          status['external'][pid] = {
+            'url': plugin.base_url,
+            'healthy': plugin.is_healthy,
+            'last_check': plugin.last_check.isoformat() if plugin.last_check else None,
+            'error_count': plugin.error_count,
+          }
+        return status
+
+      @app.post('/api/plugins/{plugin_id}/health-check')
+      async def check_plugin_health(plugin_id: str):
+        ok = await external_plugin_registry.health_check(plugin_id)
+        plugin = external_plugin_registry.get_plugin(plugin_id)
+        if not plugin:
+          raise HTTPException(status_code=404, detail='plugin not found')
+        return {'plugin_id': plugin_id, 'healthy': ok, 'checked_at': plugin.last_check.isoformat() if plugin.last_check else None}
+
+      @app.post('/api/plugins/health-check-all')
+      async def check_all_plugins_health():
+        return await external_plugin_registry.health_check_all()
 
     @app.post('/api/registry/plugins')
     async def registry_publish(payload: Dict[str, Any]):
@@ -548,7 +678,10 @@ def create_admin_app(orchestrator) -> FastAPI:
     try:
       from .plugins.yandex_smart_home import handler as yandex_handler
     except Exception:
-      yandex_handler = None
+      try:
+        from plugins.yandex_smart_home import handler as yandex_handler
+      except Exception:
+        yandex_handler = None
 
     @app.get('/api/plugins/yandex/start_oauth')
     async def yandex_start_oauth():
@@ -648,10 +781,6 @@ def create_admin_app(orchestrator) -> FastAPI:
             <h1>Core Admin</h1>
             <div class=\"grid\">
               <div class=\"card\">
-                <h2>Сервисы</h2>
-                <div id=\"services\">Загрузка...</div>
-              </div>
-              <div class=\"card\">
                 <h2>Клиенты</h2>
                 <div id=\"clients\">Загрузка...</div>
               </div>
@@ -674,32 +803,6 @@ def create_admin_app(orchestrator) -> FastAPI:
                 const res = await fetch(path, opts);
                 if (!res.ok) throw new Error(await res.text());
                 return await res.json();
-              }
-
-              async function loadServices() {
-                const data = await fetchJSON('/api/services');
-                const el = document.getElementById('services');
-                const rows = Object.values(data).map(s => `
-                  <tr>
-                    <td><code>${s.name}</code></td>
-                    <td class=\"${s.running === 'yes' ? 'ok' : 'bad'}\">${s.running}</td>
-                    <td class=\"${s.healthy === 'yes' ? 'ok' : 'bad'}\">${s.healthy}</td>
-                    <td>${s.pid}</td>
-                    <td>
-                      <button onclick=\"svcAction('restart','${s.name}')\">restart</button>
-                      <button onclick=\"svcAction('stop','${s.name}')\">stop</button>
-                      <button onclick=\"svcAction('start','${s.name}')\">start</button>
-                    </td>
-                  </tr>`).join('');
-                el.innerHTML = `<table>
-                  <thead><tr><th>name</th><th>running</th><th>healthy</th><th>pid</th><th>actions</th></tr></thead>
-                  <tbody>${rows}</tbody>
-                </table>`;
-              }
-
-              async function svcAction(action, name) {
-                await fetchJSON(`/api/services/${action}/${name}`, { method: 'POST' });
-                await loadServices();
               }
 
               async function loadClients() {
@@ -730,6 +833,42 @@ def create_admin_app(orchestrator) -> FastAPI:
                   const details = JSON.stringify(forwarded, null, 2).substring(0, 2000);
                   const proceed = confirm('Dry-run result:\n' + details + '\n\nApply real install on host?');
                   if (!proceed) return;
+
+
+                def register_external_plugins_from_env() -> list:
+                    """Auto-register external plugins from environment variables.
+
+                    Variables format:
+                      PLUGIN_{NAME}_URL=http://service:port
+                      PLUGIN_{NAME}_AUTH_TYPE=bearer|api_key
+                      PLUGIN_{NAME}_AUTH_TOKEN=secret
+                    """
+                    import re
+                    registered = []
+                    pattern = re.compile(r'^PLUGIN_([A-Z0-9_]+)_URL$')
+                    for k, v in os.environ.items():
+                        m = pattern.match(k)
+                        if not m:
+                            continue
+                        name = m.group(1)
+                        plugin_id = name.lower().replace('_', '-')
+                        base_url = v
+                        auth_type = os.getenv(f'PLUGIN_{name}_AUTH_TYPE')
+                        auth_token = os.getenv(f'PLUGIN_{name}_AUTH_TOKEN')
+                        timeout = float(os.getenv(f'PLUGIN_{name}_TIMEOUT', '30.0'))
+                        try:
+                            external_plugin_registry.register(
+                                plugin_id=plugin_id,
+                                base_url=base_url,
+                                auth_type=auth_type,
+                                auth_token=auth_token,
+                                timeout=timeout,
+                            )
+                            registered.append(plugin_id)
+                        except Exception:
+                            logger = logging.getLogger(__name__)
+                            logger.warning(f"Failed registering external plugin from ENV: {plugin_id}")
+                    return registered
 
                   // Step 2: real install (confirm)
                   const resp2 = await fetch(`/api/clients/${clientId}/install`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ install_token: installToken, dry_run: false }) });
@@ -800,7 +939,7 @@ def create_admin_app(orchestrator) -> FastAPI:
               }
 
               async function tick() {
-                await Promise.all([loadServices(), loadClients(), loadEnrollments(), loadHistory()]);
+                await Promise.all([loadClients(), loadEnrollments(), loadHistory()]);
               }
               tick();
               setInterval(tick, 5000);
@@ -809,44 +948,6 @@ def create_admin_app(orchestrator) -> FastAPI:
         </html>
         """
         return HTMLResponse(content=html)
-
-    # --- Services ---
-    @app.get("/api/services")
-    async def services_status() -> JSONResponse:
-        return JSONResponse(orchestrator.get_services_status())
-    @app.get("/admin/api/services")
-    async def services_status_compat() -> JSONResponse:
-        return await services_status()
-
-    @app.post("/api/services/restart/{name}")
-    async def services_restart(name: str) -> JSONResponse:
-        ok = orchestrator.restart(name)
-        if not ok:
-            raise HTTPException(status_code=404, detail="service not found")
-        return JSONResponse({"message": "restarted", "name": name})
-    @app.post("/admin/api/services/restart/{name}")
-    async def services_restart_compat(name: str) -> JSONResponse:
-        return await services_restart(name)
-
-    @app.post("/api/services/stop/{name}")
-    async def services_stop(name: str) -> JSONResponse:
-        ok = orchestrator.stop(name)
-        if not ok:
-            raise HTTPException(status_code=404, detail="service not found")
-        return JSONResponse({"message": "stopped", "name": name})
-    @app.post("/admin/api/services/stop/{name}")
-    async def services_stop_compat(name: str) -> JSONResponse:
-        return await services_stop(name)
-
-    @app.post("/api/services/start/{name}")
-    async def services_start(name: str) -> JSONResponse:
-        ok = orchestrator.start(name)
-        if not ok:
-            raise HTTPException(status_code=404, detail="service not found")
-        return JSONResponse({"message": "started", "name": name})
-    @app.post("/admin/api/services/start/{name}")
-    async def services_start_compat(name: str) -> JSONResponse:
-        return await services_start(name)
 
     # --- Clients proxy to client_manager ---
     @app.get("/api/clients")

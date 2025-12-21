@@ -10,14 +10,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 
 # Копируем только зависимости для кеша и используем BuildKit cache для pip
 # Требует buildx/BuildKit, но workflow использует buildx
-COPY requirements.txt /app/requirements.txt
+# Берём файл зависимостей для service-а из каталога `core-service`
+COPY core-service/requirements.txt /app/requirements.txt
+COPY sdk/python /app/sdk/python
+RUN --mount=type=cache,target=/root/.cache/pip pip install --no-cache-dir -e /app/sdk/python
 RUN --mount=type=cache,target=/root/.cache/pip pip install --no-cache-dir -r /app/requirements.txt
 
 # Код монтируется томом в dev. На проде можно раскомментировать COPY:
 RUN mkdir -p /app/core_service
-# Копируем весь репозиторий внутрь папки пакета, чтобы запуск через
-# `python -m core_service.main` работал корректно (создаём package)
-COPY . /app/core_service
+# Копируем только содержимое каталога `core-service` внутрь пакета,
+# чтобы `python -m core_service.main` импортировал корректный модуль.
+COPY core-service/ /app/core_service/
 RUN if [ ! -f /app/core_service/__init__.py ]; then touch /app/core_service/__init__.py; fi
 
 EXPOSE 11000

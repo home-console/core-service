@@ -61,7 +61,9 @@ class Device(Base):
     id = Column(String(128), primary_key=True)
     name = Column(String(255), nullable=False)
     type = Column(String(64), nullable=True)
-    metadata = Column(JSON, nullable=True)
+    # `metadata` is reserved by SQLAlchemy Declarative API, use attribute name `meta`
+    # but keep the DB column name as `metadata` for compatibility.
+    meta = Column('metadata', JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
