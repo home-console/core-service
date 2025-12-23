@@ -7,7 +7,7 @@ Core Service: FastAPI приложение с плагинной системо�
 import os
 import sys
 import uvicorn
-from .admin_app import create_admin_app
+from .app import create_admin_app
 import signal
 
 

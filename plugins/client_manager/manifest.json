@@ -1,18 +1,20 @@
 {
-  "name": "client_manager",
-  "version": "0.1.0",
-  "description": "Remote Client Manager as a plugin (docker delivery)",
-  "type": "docker",
-  "artifact": {
-    "image": "mishazx/client_manager:0.1.0",
-    "pull_policy": "IfNotPresent"
-  },
-  "entrypoint": null,
-  "install": {
-    "strategy": "docker",
-    "run": {
-      "detach": true,
-      "args": ["--restart=unless-stopped"]
-    }
+  "id": "client_manager",
+  "name": "Client Manager",
+  "version": "1.0.0",
+  "description": "Internal plugin for managing clients, file transfers, and enrollments",
+  "type": "internal",
+  "author": "Home Console Team",
+  "runtime_mode": "microservice",
+  "supported_modes": [
+    "in_process",
+    "microservice"
+  ],
+  "mode_switch_supported": true,
+  "infrastructure": true,
+  "external_service": {
+    "name": "client-manager-service",
+    "default_url": "http://client_manager:10000",
+    "env_var": "CM_BASE_URL"
   }
 }

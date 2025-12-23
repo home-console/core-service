@@ -22,20 +22,67 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from sqladmin import Admin, ModelView
+import sqlalchemy as sa
+from sqlalchemy import text
 
-# Relative imports
+# Relative imports - try relative first, then absolute with package prefix
 try:
     from .db import engine, get_session
-    from .models import Base, Client, CommandLog, Enrollment
+    from .models import Base
     from .plugin_loader import PluginLoader
     from .plugin_registry import external_plugin_registry
+    from .plugin_mode_manager import init_plugin_mode_manager
+    from .plugin_config import init_plugin_config_manager
+    from .plugin_lifecycle_manager import init_plugin_lifecycle_manager
+    from .plugin_security_manager import init_plugin_security_manager
+    from .plugin_dependency_manager import init_plugin_dependency_manager
     from .health_monitor import HealthMonitor
 except ImportError:
-    from db import engine, get_session
-    from models import Base, Client, CommandLog, Enrollment
-    from plugin_loader import PluginLoader
-    from plugin_registry import external_plugin_registry
-    from health_monitor import HealthMonitor
+    # Fallback to absolute imports with package prefix
+    from core_service.db import engine, get_session
+    from core_service.models import Base
+    from core_service.plugin_loader import PluginLoader
+    from core_service.plugin_registry import external_plugin_registry
+    from core_service.plugin_mode_manager import init_plugin_mode_manager
+    from core_service.plugin_config import init_plugin_config_manager
+    from core_service.plugin_lifecycle_manager import init_plugin_lifecycle_manager
+    from core_service.plugin_security_manager import init_plugin_security_manager
+    from core_service.plugin_dependency_manager import init_plugin_dependency_manager
+    from core_service.health_monitor import HealthMonitor
+
+# Client, CommandLog, Enrollment models are now in plugins/client_manager/models.py
+# Import them conditionally for SQLAdmin views (only if plugin is loaded)
+Client = None
+CommandLog = None
+Enrollment = None
+
+try:
+    # Try relative import first
+    from .plugins.client_manager.models import Client, CommandLog, Enrollment
+except ImportError:
+    try:
+        # Try absolute import with package prefix
+        from core_service.plugins.client_manager.models import Client, CommandLog, Enrollment
+    except ImportError:
+        # Models not available - plugin may not be loaded yet or path is wrong
+        # This is OK - SQLAdmin views will be skipped
+        pass
+
+# Core models (always defined in core-service/models.py) - import with fallback
+Device = None
+PluginBinding = None
+IntentMapping = None
+Plugin = None
+PluginVersion = None
+PluginInstallJob = None
+try:
+    from .models import Device, PluginBinding, IntentMapping, Plugin, PluginVersion, PluginInstallJob
+except ImportError:
+    try:
+        from core_service.models import Device, PluginBinding, IntentMapping, Plugin, PluginVersion, PluginInstallJob
+    except ImportError:
+        # If models can't be imported, leave as None; admin views will be skipped
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -44,20 +91,73 @@ _health_monitor = None
 
 
 # ============= SQLAdmin Model Views =============
+# Note: Client, CommandLog, Enrollment models are in client_manager plugin
+# These views are only created if models are available
 
-class ClientAdmin(ModelView, model=Client):
-    column_list = [Client.id, Client.hostname, Client.ip, Client.port, Client.status, Client.last_heartbeat]
-    name_plural = "Clients"
+if Client is not None:
+    class ClientAdmin(ModelView, model=Client):
+        column_list = [Client.id, Client.hostname, Client.ip, Client.port, Client.status, Client.last_heartbeat]
+        name_plural = "Clients"
+else:
+    ClientAdmin = None
+
+if CommandLog is not None:
+    class CommandLogAdmin(ModelView, model=CommandLog):
+        column_list = [CommandLog.id, CommandLog.client_id, CommandLog.command, CommandLog.status, CommandLog.exit_code, CommandLog.created_at]
+        name_plural = "Command Logs"
+else:
+    CommandLogAdmin = None
+
+if Enrollment is not None:
+    class EnrollmentAdmin(ModelView, model=Enrollment):
+        column_list = [Enrollment.id, Enrollment.status, Enrollment.created_at]
+        name_plural = "Enrollments"
+else:
+    EnrollmentAdmin = None
 
 
-class CommandLogAdmin(ModelView, model=CommandLog):
-    column_list = [CommandLog.id, CommandLog.client_id, CommandLog.command, CommandLog.status, CommandLog.exit_code, CommandLog.created_at]
-    name_plural = "Command Logs"
+# ============= Core Model Admin Views =============
+if Device is not None:
+    class DeviceAdmin(ModelView, model=Device):
+        column_list = [Device.id, Device.name, Device.type, Device.created_at]
+        name_plural = "Devices"
+else:
+    DeviceAdmin = None
 
+if PluginBinding is not None:
+    class PluginBindingAdmin(ModelView, model=PluginBinding):
+        column_list = [PluginBinding.id, PluginBinding.device_id, PluginBinding.plugin_name, PluginBinding.enabled, PluginBinding.created_at]
+        name_plural = "Plugin Bindings"
+else:
+    PluginBindingAdmin = None
 
-class EnrollmentAdmin(ModelView, model=Enrollment):
-    column_list = [Enrollment.id, Enrollment.status, Enrollment.created_at]
-    name_plural = "Enrollments"
+if IntentMapping is not None:
+    class IntentMappingAdmin(ModelView, model=IntentMapping):
+        column_list = [IntentMapping.id, IntentMapping.intent_name, IntentMapping.selector, IntentMapping.plugin_action, IntentMapping.created_at]
+        name_plural = "Intent Mappings"
+else:
+    IntentMappingAdmin = None
+
+if Plugin is not None:
+    class PluginAdmin(ModelView, model=Plugin):
+        column_list = [Plugin.id, Plugin.name, Plugin.publisher, Plugin.latest_version, Plugin.created_at]
+        name_plural = "Plugins"
+else:
+    PluginAdmin = None
+
+if PluginVersion is not None:
+    class PluginVersionAdmin(ModelView, model=PluginVersion):
+        column_list = [PluginVersion.id, PluginVersion.plugin_name, PluginVersion.version, PluginVersion.type, PluginVersion.artifact_url, PluginVersion.created_at]
+        name_plural = "Plugin Versions"
+else:
+    PluginVersionAdmin = None
+
+if PluginInstallJob is not None:
+    class PluginInstallJobAdmin(ModelView, model=PluginInstallJob):
+        column_list = [PluginInstallJob.id, PluginInstallJob.plugin_name, PluginInstallJob.version, PluginInstallJob.status, PluginInstallJob.created_at, PluginInstallJob.started_at, PluginInstallJob.finished_at]
+        name_plural = "Plugin Install Jobs"
+else:
+    PluginInstallJobAdmin = None
 
 
 # ============= Lifecycle Management =============
@@ -102,21 +202,100 @@ def register_external_plugins_from_env() -> list:
 async def lifespan(app: FastAPI):
     """Application lifecycle manager - startup and shutdown logic."""
     # Startup
-    Base.metadata.create_all(bind=engine)
+    # Создаем таблицы асинхронно
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+        # Ensure new plugin schema columns exist (for backward compatibility
+        # when migrations were not applied to the target DB). We run a
+        # synchronous inspector in the sync context and ALTER TABLE if needed.
+        def _ensure_plugin_columns(sync_conn):
+            inspector = sa.inspect(sync_conn)
+            if 'plugins' not in inspector.get_table_names():
+                return
+            cols = [c['name'] for c in inspector.get_columns('plugins')]
+            to_alter = []
+            if 'supported_modes' not in cols:
+                to_alter.append('supported_modes')
+            if 'mode_switch_supported' not in cols:
+                to_alter.append('mode_switch_supported')
+
+            if not to_alter:
+                return
+
+            dialect = sync_conn.dialect.name
+            # Build and execute ALTER statements appropriate for dialect
+            for col in to_alter:
+                try:
+                    if col == 'supported_modes':
+                        if dialect == 'postgresql':
+                            sync_conn.execute(text('ALTER TABLE plugins ADD COLUMN supported_modes JSON'))
+                        else:
+                            # SQLite and others: declare JSON (stored as TEXT) or generic
+                            sync_conn.execute(text('ALTER TABLE plugins ADD COLUMN supported_modes JSON'))
+                    elif col == 'mode_switch_supported':
+                        if dialect == 'postgresql':
+                            sync_conn.execute(text('ALTER TABLE plugins ADD COLUMN mode_switch_supported BOOLEAN DEFAULT false'))
+                        else:
+                            sync_conn.execute(text('ALTER TABLE plugins ADD COLUMN mode_switch_supported BOOLEAN'))
+                except Exception:
+                    # Best-effort: ignore failures and continue starting app
+                    pass
+
+        await conn.run_sync(_ensure_plugin_columns)
     
     # Load internal plugins
     try:
-        from event_bus import event_bus
-        import asyncio
+        # Import event_bus with fallback
+        try:
+            from .event_bus import event_bus
+        except ImportError:
+            from core_service.event_bus import event_bus
         
+        import asyncio
+
         plugin_loader = PluginLoader(app, get_session)
         await plugin_loader.load_all()
-        
+
         # Save to app state for access from endpoints
         app.state.plugin_loader = plugin_loader
         app.state.event_bus = event_bus
-        
+
         logger.info(f"✅ Loaded {len(plugin_loader.plugins)} internal plugins")
+
+        # Initialize plugin managers
+        try:
+            from .plugin_mode_manager import init_plugin_mode_manager
+            from .plugin_config import init_plugin_config_manager
+            from .plugin_lifecycle_manager import init_plugin_lifecycle_manager
+            from .plugin_security_manager import init_plugin_security_manager
+            from .plugin_dependency_manager import init_plugin_dependency_manager
+
+            plugin_mode_manager = init_plugin_mode_manager(plugin_loader)
+            plugin_config_manager = init_plugin_config_manager()
+            plugin_lifecycle_manager = init_plugin_lifecycle_manager()
+            plugin_security_manager = init_plugin_security_manager()
+            plugin_dependency_manager = init_plugin_dependency_manager()
+
+            # Load all plugin configurations
+            await plugin_config_manager.load_all_configs()
+
+            # Save to app state
+            app.state.plugin_mode_manager = plugin_mode_manager
+            app.state.plugin_config_manager = plugin_config_manager
+            app.state.plugin_lifecycle_manager = plugin_lifecycle_manager
+            app.state.plugin_security_manager = plugin_security_manager
+            app.state.plugin_dependency_manager = plugin_dependency_manager
+
+            logger.info("✅ All plugin managers initialized")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize plugin managers: {e}")
+        
+        # Force OpenAPI schema regeneration after all plugins are loaded
+        # This ensures Swagger UI shows all plugin routes
+        if hasattr(app, 'openapi_schema'):
+            app.openapi_schema = None
+            logger.debug("🔄 Cleared OpenAPI schema after plugin load")
         
         # Auto-register external plugins from ENV
         registered = register_external_plugins_from_env()
@@ -148,7 +327,37 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     try:
+        # Cleanup plugin managers
+        if hasattr(app.state, 'plugin_mode_manager'):
+            await app.state.plugin_mode_manager.cleanup()
+    except Exception:
+        pass
+    try:
+        # Cleanup lifecycle manager
+        if hasattr(app.state, 'plugin_lifecycle_manager'):
+            await app.state.plugin_lifecycle_manager.cleanup()
+    except Exception:
+        pass
+    try:
+        # Cleanup dependency manager
+        if hasattr(app.state, 'plugin_dependency_manager'):
+            # No cleanup needed for dependency manager
+            pass
+    except Exception:
+        pass
+    try:
         await external_plugin_registry.aclose()
+    except Exception:
+        pass
+    try:
+        # Закрываем HTTP клиент
+        from .utils.http_client import _close_http_client
+        await _close_http_client()
+    except Exception:
+        pass
+    try:
+        # Закрываем async engine
+        await engine.dispose()
     except Exception:
         pass
 
@@ -176,7 +385,7 @@ def create_admin_app() -> FastAPI:
     )
     
     # ============= CORS Configuration =============
-    origins_env = os.getenv("CORS_ALLOW_ORIGINS") or os.getenv("ALLOWED_ORIGINS") or "http://localhost:3000"
+    origins_env = os.getenv("CORS_ALLOW_ORIGINS") or os.getenv("ALLOWED_ORIGINS") or "http://localhost:3000,http://localhost:80"
     if origins_env.strip() == "*":
         allow_origins = ["*"]
     else:
@@ -192,11 +401,36 @@ def create_admin_app() -> FastAPI:
         allow_headers=["*"]
     )
     
+    # ============= Static Files (for production) =============
+    # В production можно отдавать фронтенд из core-service
+    # В dev фронтенд работает отдельно на порту 3000
+    static_dir = os.path.join(os.path.dirname(__file__), 'static')
+    if os.path.exists(static_dir) and os.listdir(static_dir):
+        from fastapi.staticfiles import StaticFiles
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+    
     # ============= SQLAdmin Panel =============
     admin = Admin(app, engine)
-    admin.add_view(ClientAdmin)
-    admin.add_view(CommandLogAdmin)
-    admin.add_view(EnrollmentAdmin)
+    # Add views only if models are available (from client_manager plugin)
+    if ClientAdmin is not None:
+        admin.add_view(ClientAdmin)
+    if CommandLogAdmin is not None:
+        admin.add_view(CommandLogAdmin)
+    if EnrollmentAdmin is not None:
+        admin.add_view(EnrollmentAdmin)
+    # Core model views
+    if DeviceAdmin is not None:
+        admin.add_view(DeviceAdmin)
+    if PluginBindingAdmin is not None:
+        admin.add_view(PluginBindingAdmin)
+    if IntentMappingAdmin is not None:
+        admin.add_view(IntentMappingAdmin)
+    if PluginAdmin is not None:
+        admin.add_view(PluginAdmin)
+    if PluginVersionAdmin is not None:
+        admin.add_view(PluginVersionAdmin)
+    if PluginInstallJobAdmin is not None:
+        admin.add_view(PluginInstallJobAdmin)
     
     # ============= Basic Routes =============
     
@@ -227,23 +461,22 @@ def create_admin_app() -> FastAPI:
             "external_plugins": len(external_plugin_registry.plugins)
         }
     
-    # ============= TODO: Mount Routers =============
-    # Once we extract routes to separate files:
-    # from .routes import clients, plugins, files, enrollments
-    # app.include_router(clients.router, prefix="/api")
-    # app.include_router(plugins.router, prefix="/api")
-    # app.include_router(files.router, prefix="/api")
-    # app.include_router(enrollments.router, prefix="/api")
-    
-    # ============= TEMPORARY: Keep old routes =============
-    # Import all the old endpoint functions from admin_app
-    # This is a temporary bridge until routes are fully extracted
+    # ============= Mount Routers =============
     try:
-        from . import admin_app
-        # Copy over all the route handlers
-        # (This is hacky but maintains compatibility during transition)
+        from .routes import devices, plugins, admin
+        
+        # Mount core routes (only device management)
+        app.include_router(admin.router, tags=["admin"])
+        app.include_router(devices.router, prefix="/api", tags=["devices"])
+        app.include_router(plugins.router, prefix="/api", tags=["plugins"])
+        
+        # Client, files, and enrollments routes are now loaded as plugins
+        # (client_manager plugin will mount them automatically)
+        
+        logger.info("✅ Core routes mounted successfully")
     except Exception as e:
-        logger.warning(f"Could not import old admin_app routes: {e}")
+        logger.error(f"❌ Failed to mount routes: {e}")
+        raise
     
     return app
 

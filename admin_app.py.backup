@@ -44,168 +44,21 @@ import random
 import string
 from .health_monitor import HealthMonitor
 
+# Import utilities from refactored modules
+try:
+  from .utils.http_client import _http_json, _http_multipart, _http_multipart_stream
+  from .utils.auth import generate_jwt_token, get_admin_headers
+except ImportError:
+  from utils.http_client import _http_json, _http_multipart, _http_multipart_stream
+  from utils.auth import generate_jwt_token, get_admin_headers
+
 # module-level health monitor handle
 _health_monitor = None
 
-
-def _http_json(method: str, url: str, body: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 15.0) -> Any:
-    base = os.getenv("CM_BASE_URL", "http://127.0.0.1:10000")
-    from urllib.parse import urlparse as _parse
-    b = _parse(base)
-    scheme = (b.scheme or "http").lower()
-    host = b.hostname or "127.0.0.1"
-    port = b.port or (443 if scheme == "https" else 80)
-    path = url
-    if not path.startswith("/"):
-        path = "/" + path
-    if scheme == "https":
-        import ssl
-        ctx = ssl.create_default_context()
-        # Dev-режим: отключаем проверку сертификата внутри docker-сети
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
-    else:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-    try:
-        payload = None
-        hdrs = {"Content-Type": "application/json"}
-        if headers:
-            hdrs.update(headers)
-        if body is not None:
-            payload = json.dumps(body)
-        conn.request(method.upper(), path, body=payload, headers=hdrs)
-        resp = conn.getresponse()
-        data = resp.read()
-        text = data.decode("utf-8") if data else ""
-        if 200 <= resp.status < 300:
-            return json.loads(text) if text else None
-        raise HTTPException(status_code=resp.status, detail=text or "Upstream error")
-    except (TimeoutError, ConnectionError, OSError) as e:
-        raise HTTPException(status_code=503, detail=f"Client manager unavailable: {str(e)}")
-    finally:
-        try:
-            conn.close()
-        except:
-            pass
-
-def _http_multipart(path: str, fields: Dict[str, str], file_field: str, filename: str, file_bytes: bytes, file_content_type: str = "application/octet-stream", timeout: float = 30.0) -> Any:
-    """Send a multipart/form-data POST to the configured client_manager base url.
-    This is a minimal implementation suitable for small-to-medium files in dev.
-    """
-    base = os.getenv("CM_BASE_URL", "http://127.0.0.1:10000")
-    from urllib.parse import urlparse as _parse
-    b = _parse(base)
-    scheme = (b.scheme or "http").lower()
-    host = b.hostname or "127.0.0.1"
-    port = b.port or (443 if scheme == "https" else 80)
-    if not path.startswith("/"):
-        path = "/" + path
-
-    boundary = "----boundary" + ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
-    crlf = "\r\n"
-    body_parts = []
-    for k, v in (fields or {}).items():
-      # Do not include a trailing CRLF after the value — the join will
-      # insert separators and we will append separators around the file part.
-      body_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{k}\"{crlf}{crlf}{v}")
-
-    # file part (headers end with two CRLFs, file bytes follow immediately)
-    body_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"{crlf}Content-Type: {file_content_type}{crlf}{crlf}")
-
-    # Join parts with CRLF, then append file bytes, a CRLF and the final boundary.
-    body_bytes = crlf.join(body_parts).encode("utf-8") + file_bytes + crlf.encode("utf-8") + f"--{boundary}--{crlf}".encode("utf-8")
-
-    hdrs = {"Content-Type": f"multipart/form-data; boundary={boundary}", "Content-Length": str(len(body_bytes))}
-
-    if scheme == "https":
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
-    else:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-
-    try:
-        conn.request('POST', path, body=body_bytes, headers=hdrs)
-        resp = conn.getresponse()
-        data = resp.read()
-        text = data.decode("utf-8") if data else ""
-        if 200 <= resp.status < 300:
-            return json.loads(text) if text else None
-        raise HTTPException(status_code=resp.status, detail=text or "Upstream error")
-    except (TimeoutError, ConnectionError, OSError) as e:
-        raise HTTPException(status_code=503, detail=f"Client manager unavailable: {str(e)}")
-    finally:
-        try:
-            conn.close()
-        except:
-            pass
-
-
-def _http_multipart_stream(path: str, fields: Dict[str, str], file_field: str, filename: str, file_path: str, file_content_type: str = "application/octet-stream", timeout: float = 30.0) -> Any:
-    """Stream a multipart/form-data POST to the configured client_manager using chunked encoding.
-    body will be an iterator yielding bytes: preamble -> file chunks -> epilogue.
-    This avoids loading the whole file into memory.
-    """
-    base = os.getenv("CM_BASE_URL", "http://127.0.0.1:10000")
-    from urllib.parse import urlparse as _parse
-    b = _parse(base)
-    scheme = (b.scheme or "http").lower()
-    host = b.hostname or "127.0.0.1"
-    port = b.port or (443 if scheme == "https" else 80)
-    if not path.startswith("/"):
-        path = "/" + path
-
-    boundary = "----boundary" + ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
-    crlf = "\r\n"
-
-    # prepare preamble (fields + file header)
-    pre_parts = []
-    for k, v in (fields or {}).items():
-        pre_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{k}\"{crlf}{crlf}{v}")
-    pre_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"{crlf}Content-Type: {file_content_type}{crlf}{crlf}")
-    preamble = crlf.join(pre_parts).encode("utf-8")
-    epilogue = (crlf + f"--{boundary}--{crlf}").encode("utf-8")
-
-    hdrs = {"Content-Type": f"multipart/form-data; boundary={boundary}", "Transfer-Encoding": "chunked"}
-
-    if scheme == "https":
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
-    else:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-
-    def body_iter():
-        yield preamble
-        with open(file_path, "rb") as f:
-            while True:
-                chunk = f.read(64 * 1024)
-                if not chunk:
-                    break
-                yield chunk
-        yield epilogue
-
-    try:
-        # Use encode_chunked to stream the iterable body
-        conn.request('POST', path, body=body_iter(), headers=hdrs, encode_chunked=True)
-        resp = conn.getresponse()
-        data = resp.read()
-        text = data.decode("utf-8") if data else ""
-        if 200 <= resp.status < 300:
-            return json.loads(text) if text else None
-        raise HTTPException(status_code=resp.status, detail=text or "Upstream error")
-    except (TimeoutError, ConnectionError, OSError) as e:
-        raise HTTPException(status_code=503, detail=f"Client manager unavailable: {str(e)}")
-    finally:
-        try:
-            conn.close()
-        except:
-            pass
+# Keep old function signatures for backwards compatibility (deprecated)
+def _http_json_deprecated(method: str, url: str, body: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 15.0) -> Any:
+    """Deprecated: Use utils.http_client._http_json instead"""
+    return _http_json(method, url, body, headers, timeout)
 
 
 class ClientAdmin(ModelView, model=Client):
@@ -221,6 +74,42 @@ class CommandLogAdmin(ModelView, model=CommandLog):
 class EnrollmentAdmin(ModelView, model=Enrollment):
     column_list = [Enrollment.id, Enrollment.status, Enrollment.created_at]
     name_plural = "Enrollments"
+
+
+def register_external_plugins_from_env() -> list:
+    """Auto-register external plugins from environment variables.
+
+    Variables format:
+      PLUGIN_{NAME}_URL=http://service:port
+      PLUGIN_{NAME}_AUTH_TYPE=bearer|api_key
+      PLUGIN_{NAME}_AUTH_TOKEN=secret
+    """
+    import re
+    registered = []
+    pattern = re.compile(r'^PLUGIN_([A-Z0-9_]+)_URL$')
+    for k, v in os.environ.items():
+        m = pattern.match(k)
+        if not m:
+            continue
+        name = m.group(1)
+        plugin_id = name.lower().replace('_', '-')
+        base_url = v
+        auth_type = os.getenv(f'PLUGIN_{name}_AUTH_TYPE')
+        auth_token = os.getenv(f'PLUGIN_{name}_AUTH_TOKEN')
+        timeout = float(os.getenv(f'PLUGIN_{name}_TIMEOUT', '30.0'))
+        try:
+            external_plugin_registry.register(
+                plugin_id=plugin_id,
+                base_url=base_url,
+                auth_type=auth_type,
+                auth_token=auth_token,
+                timeout=timeout,
+            )
+            registered.append(plugin_id)
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed registering external plugin from ENV: {plugin_id}: {e}")
+    return registered
 
 
 @asynccontextmanager
@@ -833,42 +722,6 @@ def create_admin_app() -> FastAPI:
                   const details = JSON.stringify(forwarded, null, 2).substring(0, 2000);
                   const proceed = confirm('Dry-run result:\n' + details + '\n\nApply real install on host?');
                   if (!proceed) return;
-
-
-                def register_external_plugins_from_env() -> list:
-                    """Auto-register external plugins from environment variables.
-
-                    Variables format:
-                      PLUGIN_{NAME}_URL=http://service:port
-                      PLUGIN_{NAME}_AUTH_TYPE=bearer|api_key
-                      PLUGIN_{NAME}_AUTH_TOKEN=secret
-                    """
-                    import re
-                    registered = []
-                    pattern = re.compile(r'^PLUGIN_([A-Z0-9_]+)_URL$')
-                    for k, v in os.environ.items():
-                        m = pattern.match(k)
-                        if not m:
-                            continue
-                        name = m.group(1)
-                        plugin_id = name.lower().replace('_', '-')
-                        base_url = v
-                        auth_type = os.getenv(f'PLUGIN_{name}_AUTH_TYPE')
-                        auth_token = os.getenv(f'PLUGIN_{name}_AUTH_TOKEN')
-                        timeout = float(os.getenv(f'PLUGIN_{name}_TIMEOUT', '30.0'))
-                        try:
-                            external_plugin_registry.register(
-                                plugin_id=plugin_id,
-                                base_url=base_url,
-                                auth_type=auth_type,
-                                auth_token=auth_token,
-                                timeout=timeout,
-                            )
-                            registered.append(plugin_id)
-                        except Exception:
-                            logger = logging.getLogger(__name__)
-                            logger.warning(f"Failed registering external plugin from ENV: {plugin_id}")
-                    return registered
 
                   // Step 2: real install (confirm)
                   const resp2 = await fetch(`/api/clients/${clientId}/install`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ install_token: installToken, dry_run: false }) });

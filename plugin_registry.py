@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -49,6 +50,8 @@ class ExternalPluginRegistry:
         self.plugins: Dict[str, ExternalPlugin] = {}
         self._http_client: Optional[httpx.AsyncClient] = None
         self._lock = asyncio.Lock()
+        # sync lock for register/unregister called from sync contexts
+        self._sync_lock = threading.RLock()
         logger.info("ExternalPluginRegistry initialized")
 
     @property
@@ -89,25 +92,30 @@ class ExternalPluginRegistry:
             description=description,
             metadata=kwargs.get('metadata', {}),
         )
-        self.plugins[plugin_id] = plugin
+        with self._sync_lock:
+            self.plugins[plugin_id] = plugin
         logger.info(f"Registered external plugin: {plugin_id} -> {plugin.base_url}")
         return plugin
 
     def unregister(self, plugin_id: str) -> bool:
-        if plugin_id in self.plugins:
-            del self.plugins[plugin_id]
-            logger.info(f"Unregistered plugin: {plugin_id}")
-            return True
-        return False
+        with self._sync_lock:
+            if plugin_id in self.plugins:
+                del self.plugins[plugin_id]
+                logger.info(f"Unregistered plugin: {plugin_id}")
+                return True
+            return False
 
     def get_plugin(self, plugin_id: str) -> Optional[ExternalPlugin]:
-        return self.plugins.get(plugin_id)
+        with self._sync_lock:
+            return self.plugins.get(plugin_id)
 
     def list_plugins(self) -> List[ExternalPlugin]:
-        return list(self.plugins.values())
+        with self._sync_lock:
+            return list(self.plugins.values())
 
     def is_registered(self, plugin_id: str) -> bool:
-        return plugin_id in self.plugins
+        with self._sync_lock:
+            return plugin_id in self.plugins
 
     async def proxy_request(
         self,

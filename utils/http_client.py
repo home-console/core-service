@@ -1,16 +1,41 @@
 """
 HTTP client utilities for communicating with client-manager service.
+Async implementation using httpx.
 """
 import os
 import json
-import random
-import string
-import http.client
-from typing import Any, Dict
+import logging
+from typing import Any, Dict, Optional
 from fastapi import HTTPException
+import httpx
+
+logger = logging.getLogger(__name__)
+
+# Глобальный async HTTP клиент (создается при первом использовании)
+_http_client: Optional[httpx.AsyncClient] = None
 
 
-def _http_json(
+def _get_http_client() -> httpx.AsyncClient:
+    """Получить или создать глобальный async HTTP клиент."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=30.0,
+            verify=False,  # Dev mode: disable SSL verification
+            follow_redirects=True
+        )
+    return _http_client
+
+
+async def _close_http_client():
+    """Закрыть глобальный HTTP клиент (для cleanup)."""
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
+
+
+async def _http_json(
     method: str,
     url: str,
     body: Dict[str, Any] | None = None,
@@ -18,7 +43,7 @@ def _http_json(
     timeout: float = 15.0
 ) -> Any:
     """
-    Make a JSON HTTP request to client-manager service.
+    Make an async JSON HTTP request to client-manager service.
     
     Args:
         method: HTTP method (GET, POST, PUT, DELETE, etc.)
@@ -34,49 +59,55 @@ def _http_json(
         HTTPException: On HTTP errors or connection failures
     """
     base = os.getenv("CM_BASE_URL", "http://127.0.0.1:10000")
-    from urllib.parse import urlparse as _parse
-    b = _parse(base)
-    scheme = (b.scheme or "http").lower()
-    host = b.hostname or "127.0.0.1"
-    port = b.port or (443 if scheme == "https" else 80)
-    path = url
-    if not path.startswith("/"):
-        path = "/" + path
-        
-    if scheme == "https":
-        import ssl
-        ctx = ssl.create_default_context()
-        # Dev mode: disable certificate verification inside docker network
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
-    else:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-        
+    base_url = base.rstrip('/')
+    if not url.startswith("/"):
+        url = "/" + url
+    full_url = f"{base_url}{url}"
+    
+    client = _get_http_client()
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    
     try:
-        payload = None
-        hdrs = {"Content-Type": "application/json"}
-        if headers:
-            hdrs.update(headers)
-        if body is not None:
-            payload = json.dumps(body)
-        conn.request(method.upper(), path, body=payload, headers=hdrs)
-        resp = conn.getresponse()
-        data = resp.read()
-        text = data.decode("utf-8") if data else ""
-        if 200 <= resp.status < 300:
-            return json.loads(text) if text else None
-        raise HTTPException(status_code=resp.status, detail=text or "Upstream error")
-    except (TimeoutError, ConnectionError, OSError) as e:
-        raise HTTPException(status_code=503, detail=f"Client manager unavailable: {str(e)}")
-    finally:
+        response = await client.request(
+            method=method.upper(),
+            url=full_url,
+            json=body,
+            headers=request_headers,
+            timeout=timeout
+        )
+        response.raise_for_status()
+        
+        # Пытаемся распарсить JSON, если не получается - возвращаем текст
         try:
-            conn.close()
-        except:
-            pass
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            text = response.text
+            return json.loads(text) if text else None
+            
+    except httpx.HTTPStatusError as e:
+        error_text = e.response.text if e.response else "Upstream error"
+        logger.error(f"HTTP error {e.response.status_code if e.response else 'unknown'}: {error_text}")
+        raise HTTPException(
+            status_code=e.response.status_code if e.response else 500,
+            detail=error_text
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+        logger.error(f"Connection error to client-manager: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Client manager unavailable: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in HTTP request: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
+        )
 
 
-def _http_multipart(
+async def _http_multipart(
     path: str,
     fields: Dict[str, str],
     file_field: str,
@@ -86,8 +117,7 @@ def _http_multipart(
     timeout: float = 30.0
 ) -> Any:
     """
-    Send a multipart/form-data POST to client-manager.
-    This is a minimal implementation suitable for small-to-medium files in dev.
+    Send an async multipart/form-data POST to client-manager.
     
     Args:
         path: URL path
@@ -105,55 +135,55 @@ def _http_multipart(
         HTTPException: On HTTP errors or connection failures
     """
     base = os.getenv("CM_BASE_URL", "http://127.0.0.1:10000")
-    from urllib.parse import urlparse as _parse
-    b = _parse(base)
-    scheme = (b.scheme or "http").lower()
-    host = b.hostname or "127.0.0.1"
-    port = b.port or (443 if scheme == "https" else 80)
+    base_url = base.rstrip('/')
     if not path.startswith("/"):
         path = "/" + path
-
-    boundary = "----boundary" + ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
-    crlf = "\r\n"
-    body_parts = []
-    for k, v in (fields or {}).items():
-        body_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{k}\"{crlf}{crlf}{v}")
-
-    # file part (headers end with two CRLFs, file bytes follow immediately)
-    body_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"{crlf}Content-Type: {file_content_type}{crlf}{crlf}")
-
-    # Join parts with CRLF, then append file bytes, a CRLF and the final boundary.
-    body_bytes = crlf.join(body_parts).encode("utf-8") + file_bytes + crlf.encode("utf-8") + f"--{boundary}--{crlf}".encode("utf-8")
-
-    hdrs = {"Content-Type": f"multipart/form-data; boundary={boundary}", "Content-Length": str(len(body_bytes))}
-
-    if scheme == "https":
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
-    else:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-
+    full_url = f"{base_url}{path}"
+    
+    client = _get_http_client()
+    
+    # Подготавливаем файл для multipart
+    files = {
+        file_field: (filename, file_bytes, file_content_type)
+    }
+    
     try:
-        conn.request('POST', path, body=body_bytes, headers=hdrs)
-        resp = conn.getresponse()
-        data = resp.read()
-        text = data.decode("utf-8") if data else ""
-        if 200 <= resp.status < 300:
-            return json.loads(text) if text else None
-        raise HTTPException(status_code=resp.status, detail=text or "Upstream error")
-    except (TimeoutError, ConnectionError, OSError) as e:
-        raise HTTPException(status_code=503, detail=f"Client manager unavailable: {str(e)}")
-    finally:
+        response = await client.post(
+            full_url,
+            data=fields,
+            files=files,
+            timeout=timeout
+        )
+        response.raise_for_status()
+        
         try:
-            conn.close()
-        except:
-            pass
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            text = response.text
+            return json.loads(text) if text else None
+            
+    except httpx.HTTPStatusError as e:
+        error_text = e.response.text if e.response else "Upstream error"
+        logger.error(f"HTTP error in multipart upload: {error_text}")
+        raise HTTPException(
+            status_code=e.response.status_code if e.response else 500,
+            detail=error_text
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+        logger.error(f"Connection error in multipart upload: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Client manager unavailable: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in multipart upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
+        )
 
 
-def _http_multipart_stream(
+async def _http_multipart_stream(
     path: str,
     fields: Dict[str, str],
     file_field: str,
@@ -163,8 +193,8 @@ def _http_multipart_stream(
     timeout: float = 30.0
 ) -> Any:
     """
-    Stream a multipart/form-data POST to client-manager using chunked encoding.
-    This avoids loading the whole file into memory.
+    Stream an async multipart/form-data POST to client-manager.
+    Uses file streaming to avoid loading the whole file into memory.
     
     Args:
         path: URL path
@@ -182,59 +212,74 @@ def _http_multipart_stream(
         HTTPException: On HTTP errors or connection failures
     """
     base = os.getenv("CM_BASE_URL", "http://127.0.0.1:10000")
-    from urllib.parse import urlparse as _parse
-    b = _parse(base)
-    scheme = (b.scheme or "http").lower()
-    host = b.hostname or "127.0.0.1"
-    port = b.port or (443 if scheme == "https" else 80)
+    base_url = base.rstrip('/')
     if not path.startswith("/"):
         path = "/" + path
-
-    boundary = "----boundary" + ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
-    crlf = "\r\n"
-
-    # prepare preamble (fields + file header)
-    pre_parts = []
-    for k, v in (fields or {}).items():
-        pre_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{k}\"{crlf}{crlf}{v}")
-    pre_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"{crlf}Content-Type: {file_content_type}{crlf}{crlf}")
-    preamble = crlf.join(pre_parts).encode("utf-8")
-    epilogue = (crlf + f"--{boundary}--{crlf}").encode("utf-8")
-
-    hdrs = {"Content-Type": f"multipart/form-data; boundary={boundary}", "Transfer-Encoding": "chunked"}
-
-    if scheme == "https":
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
-    else:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-
-    def body_iter():
-        yield preamble
-        with open(file_path, "rb") as f:
-            while True:
-                chunk = f.read(64 * 1024)
-                if not chunk:
-                    break
-                yield chunk
-        yield epilogue
-
+    full_url = f"{base_url}{path}"
+    
+    client = _get_http_client()
+    
+    # Используем aiofiles для async чтения файла, если доступно
+    # Иначе читаем файл синхронно (для небольших файлов это нормально)
     try:
-        # Use encode_chunked to stream the iterable body
-        conn.request('POST', path, body=body_iter(), headers=hdrs, encode_chunked=True)
-        resp = conn.getresponse()
-        data = resp.read()
-        text = data.decode("utf-8") if data else ""
-        if 200 <= resp.status < 300:
-            return json.loads(text) if text else None
-        raise HTTPException(status_code=resp.status, detail=text or "Upstream error")
-    except (TimeoutError, ConnectionError, OSError) as e:
-        raise HTTPException(status_code=503, detail=f"Client manager unavailable: {str(e)}")
-    finally:
+        import aiofiles
+        use_async = True
+    except ImportError:
+        use_async = False
+    
+    if use_async:
+        # Async чтение файла
+        async def file_stream():
+            async with aiofiles.open(file_path, "rb") as f:
+                while True:
+                    chunk = await f.read(64 * 1024)  # 64KB chunks
+                    if not chunk:
+                        break
+                    yield chunk
+        
+        files = {
+            file_field: (filename, file_stream(), file_content_type)
+        }
+    else:
+        # Синхронное чтение (для совместимости)
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+        
+        files = {
+            file_field: (filename, file_data, file_content_type)
+        }
+    
+    try:
+        response = await client.post(
+            full_url,
+            data=fields,
+            files=files,
+            timeout=timeout
+        )
+        response.raise_for_status()
+        
         try:
-            conn.close()
-        except:
-            pass
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            text = response.text
+            return json.loads(text) if text else None
+            
+    except httpx.HTTPStatusError as e:
+        error_text = e.response.text if e.response else "Upstream error"
+        logger.error(f"HTTP error in streaming upload: {error_text}")
+        raise HTTPException(
+            status_code=e.response.status_code if e.response else 500,
+            detail=error_text
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+        logger.error(f"Connection error in streaming upload: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Client manager unavailable: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in streaming upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
+        )

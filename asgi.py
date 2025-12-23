@@ -1,20 +1,25 @@
+"""
+ASGI entry point for uvicorn with hot reload support.
+Creates FastAPI app at import time so uvicorn can use --reload.
+"""
 import os
+import sys
 
-# Create Orchestrator and FastAPI app at import time so uvicorn can use
-# an import string like `core_service.asgi:app` which enables --reload.
-from .services import Orchestrator
-from .admin_app import create_admin_app
+# Ensure we're treated as part of core_service package
+if not __package__:
+    __package__ = 'core_service'
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-orch = Orchestrator(project_root=project_root)
+# Get current file directory and calculate paths
+_current_file = os.path.abspath(__file__)
+_current_dir = os.path.dirname(_current_file)
+_parent_dir = os.path.dirname(_current_dir)  # /app/core_service -> /app
 
-# Respect env var used elsewhere to disable the orchestrator in dev/tests
-if not os.getenv("CORE_DISABLE_ORCHESTRATOR"):
-    try:
-        orch.start_all()
-    except Exception:
-        # Don't raise on import-time failures; let the app start and surface
-        # errors in logs. This keeps behavior close to `main.py`.
-        pass
+# Ensure parent directory (/app) is in Python path for imports
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
 
-app = create_admin_app(orch)
+# Import app factory - use relative imports which work when imported as core_service.asgi
+from .app import create_admin_app
+
+# Create app instance
+app = create_admin_app()

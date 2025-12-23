@@ -19,10 +19,20 @@ import zipfile
 import tarfile
 import tempfile
 import shutil
+import subprocess
+import asyncio
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+from sqlalchemy import select
 from .plugin_base import InternalPluginBase
-from .event_bus import event_bus
+try:
+    from .event_bus import event_bus
+    from .models import Plugin, PluginVersion
+    from .db import get_session
+except ImportError:
+    from core_service.event_bus import event_bus
+    from core_service.models import Plugin, PluginVersion
+    from core_service.db import get_session
 
 logger = logging.getLogger(__name__)
 
@@ -85,27 +95,25 @@ class PluginLoader:
         self.event_bus = event_bus
         self.plugins: Dict[str, InternalPluginBase] = {}
         
+        # Словарь для отслеживания префиксов зарегистрированных роутеров плагинов
+        # Ключ: plugin_id, Значение: префикс роутера (для удаления при выгрузке)
+        self.plugin_routes: Dict[str, str] = {}
+        
         # Директория с внешними плагинами (из переменной окружения)
         self.external_plugins_dir = os.getenv("PLUGINS_DIR")
         
         # Временная директория для распакованных архивов
         self.temp_dir = tempfile.mkdtemp(prefix="plugins_")
+        # Lock to protect concurrent access to self.plugins and plugin_routes
+        self._lock = asyncio.Lock()
         
         logger.info(f"🔌 PluginLoader initialized")
         if self.external_plugins_dir:
             logger.info(f"📂 External plugins directory: {self.external_plugins_dir}")
         else:
             logger.info(f"📂 No external plugins directory set (PLUGINS_DIR env var)")
-        # Minimal admin endpoints so tests can query loaded plugins when
-        # PluginLoader is created standalone (outside admin_app).
-        try:
-            @self.app.get('/api/v1/admin/plugins')
-            def _admin_list_plugins():
-                return {"plugins": self.list_plugins()}
-        except Exception:
-            # If app is not a FastAPI instance or route cannot be added,
-            # ignore silently.
-            pass
+        # Note: Admin endpoints are now handled by routes/plugins.py
+        # This avoids route conflicts when plugins router is mounted
     
     async def load_all(self):
         """Загрузить все плагины: встроенные и внешние."""
@@ -118,26 +126,86 @@ class PluginLoader:
     
     async def _load_builtin_plugins(self):
         """Загрузить встроенные плагины из core-service/plugins/"""
-        try:
-            import plugins as plugins_package
-        except ImportError:
-            logger.debug("plugins package not found, skipping builtin plugin loading")
-            return
+        # Try different import paths
+        plugins_package = None
+        package_name = None
         
-        # Найти все подмодули в пакете plugins
-        plugin_modules = list(pkgutil.iter_modules(
-            plugins_package.__path__,
-            prefix=plugins_package.__name__ + "."
-        ))
+        # Try core_service.plugins first (when running as package)
+        try:
+            import core_service.plugins as plugins_package
+            package_name = "core_service.plugins"
+        except ImportError:
+            try:
+                # Fallback to plugins (when running from core-service directory)
+                import plugins as plugins_package
+                package_name = "plugins"
+            except ImportError:
+                logger.debug("plugins package not found, skipping builtin plugin loading")
+                return
+        
+        # Найти все подмодули в пакете plugins (рекурсивно)
+        try:
+            plugin_modules = []
+            # Используем walk_packages для рекурсивного поиска
+            for importer, modname, ispkg in pkgutil.walk_packages(
+                plugins_package.__path__,
+                prefix=package_name + "."
+            ):
+                plugin_modules.append((modname, ispkg))
+        except Exception as e:
+            logger.warning(f"Failed to iterate plugin modules: {e}")
+            return
         
         if not plugin_modules:
             logger.info("ℹ️ No builtin plugins found in plugins/ directory")
             return
         
-        logger.info(f"🔍 Found {len(plugin_modules)} builtin plugin(s)")
+        logger.info(f"🔍 Found {len(plugin_modules)} builtin plugin module(s)")
         
-        for _, module_name, _ in plugin_modules:
-            await self.load_plugin(module_name, plugin_type="builtin")
+        # Filter out non-plugin modules (like __init__, base, loader, embed, models)
+        excluded = {'__init__', 'base', 'loader', 'embed', 'models', 'utils'}
+        loaded_count = 0
+        for module_name, is_package in plugin_modules:
+            module_basename = module_name.split('.')[-1]
+            if module_basename in excluded:
+                logger.debug(f"⏭️ Skipping excluded module: {module_name}")
+                continue
+            
+            # Для пакетов (подпапок) проверяем, есть ли в них класс плагина
+            if is_package:
+                # Пробуем загрузить модуль и найти класс плагина
+                try:
+                    module = importlib.import_module(module_name)
+                    # Ищем класс плагина в модуле
+                    plugin_class = None
+                    for attr_name in dir(module):
+                        if attr_name.startswith('_'):
+                            continue
+                        attr = getattr(module, attr_name)
+                        if (isinstance(attr, type) and 
+                            issubclass(attr, InternalPluginBase) and 
+                            attr is not InternalPluginBase):
+                            plugin_class = attr
+                            break
+                    
+                    if plugin_class:
+                        logger.info(f"🔄 Attempting to load plugin from package: {module_name}")
+                        await self.load_plugin(module_name, plugin_type="builtin")
+                        loaded_count += 1
+                    else:
+                        logger.debug(f"⏭️ No plugin class found in package: {module_name}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to load plugin package {module_name}: {e}", exc_info=True)
+            else:
+                # Обычный модуль (файл .py)
+                logger.info(f"🔄 Attempting to load plugin: {module_name}")
+                try:
+                    await self.load_plugin(module_name, plugin_type="builtin")
+                    loaded_count += 1
+                except Exception as e:
+                    logger.error(f"❌ Failed to load plugin {module_name}: {e}", exc_info=True)
+        
+        logger.info(f"✅ Successfully loaded {loaded_count} builtin plugin(s)")
     
     async def _load_external_plugins(self):
         """Загрузить внешние плагины из PLUGINS_DIR"""
@@ -337,6 +405,11 @@ class PluginLoader:
             # Создаём экземпляр плагина
             plugin = plugin_class(self.app, self.db_session_maker, self.event_bus)
             
+            # Проверяем, включен ли плагин в БД (для плагинов, которые уже были загружены ранее)
+            if not await self._is_plugin_enabled(plugin.id):
+                logger.info(f"⏭️ Plugin {plugin.id} is disabled in DB, skipping load")
+                return
+            
             # Перезаписываем metadata из plugin.json если они есть
             if metadata.get('name'):
                 plugin.name = metadata['name']
@@ -345,25 +418,231 @@ class PluginLoader:
             if metadata.get('description'):
                 plugin.description = metadata.get('description', '')
             
-            # Вызываем on_load
-            await plugin.on_load()
+            # Сохраняем полный manifest в атрибут плагина для сохранения в БД
+            plugin.manifest = metadata
+            if metadata.get('type'):
+                plugin.type = metadata['type']
+            
+            # Вызываем on_load с обработкой ошибок
+            try:
+                await plugin.on_load()
+            except Exception as e:
+                logger.error(f"⚠️ Plugin on_load failed for {plugin.id}: {e}", exc_info=True)
+                # Продолжаем работу, роуты могут быть уже определены
             
             # Регистрируем router если он есть
             if plugin.router:
+                # Инфраструктурные плагины (client_manager) монтируются без префикса плагина
+                if plugin.id == "client_manager":
+                    prefix = "/api"
+                    logger.debug(f"  📍 Registered infrastructure plugin router at {prefix}")
+                else:
+                    prefix = f"/api/v1/plugins/{plugin.id}"
+                    logger.debug(f"  📍 Registered plugin router at {prefix}")
+                
+                # Capture routes before mounting to identify exactly which route
+                # objects are added by include_router, then store those objects
+                # so we can remove only them on unload (safer than prefix matching).
+                before_app_routes = list(self.app.routes)
+                before_router_routes = None
+                if hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
+                    try:
+                        before_router_routes = list(self.app.router.routes)
+                    except Exception:
+                        before_router_routes = None
+
                 self.app.include_router(
                     plugin.router,
-                    prefix=f"/api/v1/plugins/{plugin.id}",
+                    prefix=prefix,
                     tags=[plugin.name]
                 )
-                logger.debug(f"  📍 Registered router at /api/v1/plugins/{plugin.id}")
+
+                # Determine newly added routes
+                added_routes = []
+                try:
+                    after_app_routes = list(self.app.routes)
+                    for r in after_app_routes:
+                        if r not in before_app_routes:
+                            added_routes.append(r)
+                except Exception:
+                    pass
+
+                try:
+                    if before_router_routes is not None and hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
+                        after_router_routes = list(self.app.router.routes)
+                        for r in after_router_routes:
+                            if r not in before_router_routes and r not in added_routes:
+                                added_routes.append(r)
+                except Exception:
+                    pass
+
+                # Save route objects for precise removal on unload
+                try:
+                    async with self._lock:
+                        self.plugin_routes[plugin.id] = added_routes
+                except Exception:
+                    self.plugin_routes[plugin.id] = added_routes
+
+                # Force regenerate OpenAPI schema so Swagger UI shows newly added routes
+                try:
+                    if hasattr(self.app, 'openapi_schema'):
+                        self.app.openapi_schema = None
+                except Exception:
+                    pass
             
             # Сохраняем в реестр
-            self.plugins[plugin.id] = plugin
+            try:
+                async with self._lock:
+                    self.plugins[plugin.id] = plugin
+            except Exception:
+                # Fallback if lock not initialized
+                self.plugins[plugin.id] = plugin
+            
+            # Сохраняем информацию о плагине в БД
+            await self._save_plugin_to_db(plugin)
             
             logger.info(f"✅ Loaded external plugin: {plugin.name} v{plugin.version}")
             
         except Exception as e:
             logger.error(f"❌ Failed to load module from {file_path}: {e}", exc_info=True)
+    
+    async def _update_plugin_loaded_status(self, plugin_id: str, loaded: bool):
+        """
+        Обновить статус загрузки плагина в БД.
+        
+        Args:
+            plugin_id: ID плагина
+            loaded: True если загружен, False если выгружен
+        """
+        try:
+            async with get_session() as db:
+                existing_q = await db.execute(select(Plugin).where(Plugin.id == plugin_id))
+                existing = existing_q.scalar_one_or_none()
+                
+                if existing:
+                    existing.loaded = loaded
+                    await db.flush()
+                    logger.debug(f"💾 Updated plugin {plugin_id} loaded status to {loaded}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to update plugin {plugin_id} loaded status: {e}")
+    
+    async def _save_plugin_to_db(self, plugin: InternalPluginBase):
+        """
+        Сохранить информацию о плагине в базу данных.
+        
+        Args:
+            plugin: Экземпляр загруженного плагина
+        """
+        try:
+            async with get_session() as db:
+                # Проверяем, существует ли плагин в БД
+                existing_q = await db.execute(select(Plugin).where(Plugin.id == plugin.id))
+                existing = existing_q.scalar_one_or_none()
+                
+                # Получаем manifest если есть
+                manifest = None
+                if hasattr(plugin, 'manifest'):
+                    manifest = plugin.manifest
+                elif hasattr(plugin, '_manifest'):
+                    manifest = plugin._manifest
+
+                # Получаем type если есть
+                plugin_type = None
+                if hasattr(plugin, 'type'):
+                    plugin_type = plugin.type
+                elif hasattr(plugin, '_type'):
+                    plugin_type = plugin._type
+
+                # Определяем режим работы плагина из manifest или типа
+                runtime_mode = None
+                supported_modes = None
+                mode_switch_supported = False
+                
+                if manifest:
+                    runtime_mode = manifest.get('runtime_mode')
+                    supported_modes = manifest.get('supported_modes')
+                    mode_switch_supported = manifest.get('mode_switch_supported', False)
+                    
+                if not runtime_mode:
+                    # Определяем по типу плагина
+                    if plugin_type == 'external':
+                        runtime_mode = 'microservice'
+                    elif plugin_type == 'internal':
+                        runtime_mode = 'in_process'
+                    else:
+                        runtime_mode = 'in_process'  # По умолчанию
+                
+                # Если supported_modes не указан, определяем по типу
+                if not supported_modes:
+                    if plugin_type == 'external':
+                        supported_modes = ['microservice']
+                    elif plugin_type == 'internal':
+                        supported_modes = ['in_process']
+                    else:
+                        supported_modes = [runtime_mode]
+                
+                # Конфигурация плагина если есть
+                plugin_config = getattr(plugin, 'config', None)
+                
+                # Создаем или обновляем запись Plugin
+                if not existing:
+                    plugin_obj = Plugin(
+                        id=plugin.id,
+                        name=plugin.name or plugin.id,
+                        description=getattr(plugin, 'description', None),
+                        publisher=None,
+                        latest_version=getattr(plugin, 'version', None),
+                        enabled=True,  # при первой загрузке считаем разрешенным
+                        loaded=True,   # Плагин только что загружен
+                        runtime_mode=runtime_mode,
+                        supported_modes=supported_modes,
+                        mode_switch_supported=mode_switch_supported,
+                        config=plugin_config
+                    )
+                    db.add(plugin_obj)
+                    await db.flush()
+                    logger.debug(f"💾 Created Plugin record in DB: {plugin.id} (mode: {runtime_mode}, supported: {supported_modes})")
+                else:
+                    # Обновляем существующую запись
+                    if plugin.name:
+                        existing.name = plugin.name
+                    if hasattr(plugin, 'description') and plugin.description:
+                        existing.description = plugin.description
+                    if hasattr(plugin, 'version') and plugin.version:
+                        existing.latest_version = plugin.version
+                    # Разрешаем к загрузке при успешной загрузке
+                    if hasattr(existing, 'enabled'):
+                        existing.enabled = True
+                    existing.loaded = True  # Плагин загружен
+                    if runtime_mode:
+                        existing.runtime_mode = runtime_mode
+                    if supported_modes:
+                        existing.supported_modes = supported_modes
+                    existing.mode_switch_supported = mode_switch_supported
+                    if plugin_config is not None:
+                        existing.config = plugin_config
+                    await db.flush()
+                    logger.debug(f"💾 Updated Plugin record in DB: {plugin.id} (mode: {runtime_mode}, supported: {supported_modes})")
+                
+                # Создаем или обновляем запись PluginVersion
+                version = getattr(plugin, 'version', None) or 'unknown'
+                pv_id = f"{plugin.id}:{version}"
+
+                pv = PluginVersion(
+                    id=pv_id,
+                    plugin_name=plugin.id,
+                    version=version,
+                    manifest=manifest,
+                    artifact_url=None,
+                    type=plugin_type
+                )
+                await db.merge(pv)
+                await db.flush()
+                logger.debug(f"💾 Saved PluginVersion record in DB: {pv_id}")
+                
+        except Exception as e:
+            # Не прерываем загрузку плагина, если не удалось сохранить в БД
+            logger.warning(f"⚠️ Failed to save plugin {plugin.id} to DB: {e}", exc_info=True)
     
     def _read_plugin_metadata(self, plugin_json_path: str) -> Optional[Dict[str, Any]]:
         """
@@ -396,6 +675,34 @@ class PluginLoader:
             logger.error(f"❌ Error reading {plugin_json_path}: {e}")
             return None
     
+    async def _is_plugin_enabled(self, plugin_id: str) -> bool:
+        """
+        Проверить, включен ли плагин (loaded=True в БД).
+        
+        Args:
+            plugin_id: ID плагина
+            
+        Returns:
+            True если плагин включен, False если отключен или не найден
+        """
+        try:
+            async with get_session() as db:
+                existing_q = await db.execute(select(Plugin).where(Plugin.id == plugin_id))
+                existing = existing_q.scalar_one_or_none()
+                
+                if existing:
+                    # Если плагин есть в БД, проверяем флаг enabled (если нет - используем loaded)
+                    if hasattr(existing, 'enabled'):
+                        return bool(getattr(existing, 'enabled', True))
+                    return getattr(existing, 'loaded', True)
+                else:
+                    # Если плагина нет в БД, считаем его включенным (первая загрузка)
+                    return True
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to check plugin {plugin_id} status: {e}")
+            # В случае ошибки считаем плагин включенным
+            return True
+    
     async def load_plugin(self, module_name: str, plugin_type: str = "builtin"):
         """
         Загрузить встроенный плагин из модуля.
@@ -414,13 +721,28 @@ class PluginLoader:
             
             # Ищем класс плагина (наследник InternalPluginBase)
             plugin_class = None
-            for attr_name in dir(module):
-                attr = getattr(module, attr_name)
-                if (isinstance(attr, type) and 
-                    issubclass(attr, InternalPluginBase) and 
-                    attr is not InternalPluginBase):
-                    plugin_class = attr
-                    break
+            
+            # Сначала проверяем, есть ли класс в __all__ или экспортирован напрямую
+            if hasattr(module, '__all__'):
+                for attr_name in module.__all__:
+                    attr = getattr(module, attr_name, None)
+                    if (isinstance(attr, type) and 
+                        issubclass(attr, InternalPluginBase) and 
+                        attr is not InternalPluginBase):
+                        plugin_class = attr
+                        break
+            
+            # Если не нашли, ищем во всех атрибутах модуля
+            if not plugin_class:
+                for attr_name in dir(module):
+                    if attr_name.startswith('_'):
+                        continue
+                    attr = getattr(module, attr_name)
+                    if (isinstance(attr, type) and 
+                        issubclass(attr, InternalPluginBase) and 
+                        attr is not InternalPluginBase):
+                        plugin_class = attr
+                        break
             
             if not plugin_class:
                 logger.warning(f"⚠️ No InternalPluginBase subclass found in {module_name}")
@@ -429,20 +751,101 @@ class PluginLoader:
             # Создаём экземпляр плагина
             plugin = plugin_class(self.app, self.db_session_maker, self.event_bus)
             
+            # Проверяем, включен ли плагин в БД (для плагинов, которые уже были загружены ранее)
+            if not await self._is_plugin_enabled(plugin.id):
+                logger.info(f"⏭️ Plugin {plugin.id} is disabled in DB, skipping load")
+                return
+            
+            # Пытаемся загрузить manifest.json для встроенных плагинов
+            if plugin_type == "builtin" and hasattr(module, '__file__'):
+                module_file = module.__file__
+                if module_file:
+                    # Ищем manifest.json в папке модуля
+                    module_dir = os.path.dirname(module_file)
+                    manifest_path = os.path.join(module_dir, "manifest.json")
+                    if os.path.exists(manifest_path):
+                        try:
+                            manifest_data = self._read_plugin_metadata(manifest_path)
+                            if manifest_data:
+                                plugin.manifest = manifest_data
+                                if manifest_data.get('type'):
+                                    plugin.type = manifest_data['type']
+                                logger.debug(f"📋 Loaded manifest.json for {plugin.id}")
+                        except Exception as e:
+                            logger.debug(f"⚠️ Failed to load manifest.json for {plugin.id}: {e}")
+            
             # Вызываем on_load
             await plugin.on_load()
             
             # Регистрируем router если он есть
             if plugin.router:
+                # Инфраструктурные плагины (client_manager) монтируются без префикса плагина
+                # Остальные плагины получают стандартный префикс
+                if plugin.id == "client_manager":
+                    prefix = "/api"
+                    logger.debug(f"  📍 Registered infrastructure plugin router at {prefix}")
+                else:
+                    prefix = f"/api/v1/plugins/{plugin.id}"
+                    logger.debug(f"  📍 Registered plugin router at {prefix}")
+                
+                # Capture routes BEFORE mounting
+                before_app_routes = list(self.app.routes)
+                before_router_routes = None
+                if hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
+                    try:
+                        before_router_routes = list(self.app.router.routes)
+                    except Exception:
+                        before_router_routes = None
+
+                # Mount the plugin router
                 self.app.include_router(
                     plugin.router,
-                    prefix=f"/api/v1/plugins/{plugin.id}",
+                    prefix=prefix,
                     tags=[plugin.name]
                 )
-                logger.debug(f"  📍 Registered router at /api/v1/plugins/{plugin.id}")
+
+                # Capture routes AFTER mounting and compute diff
+                added_routes = []
+                try:
+                    after_app_routes = list(self.app.routes)
+                    for r in after_app_routes:
+                        if r not in before_app_routes:
+                            added_routes.append(r)
+                except Exception:
+                    pass
+
+                try:
+                    if before_router_routes is not None and hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
+                        after_router_routes = list(self.app.router.routes)
+                        for r in after_router_routes:
+                            if r not in before_router_routes and r not in added_routes:
+                                added_routes.append(r)
+                except Exception:
+                    pass
+
+                # Save route objects for precise removal on unload
+                try:
+                    async with self._lock:
+                        self.plugin_routes[plugin.id] = added_routes
+                except Exception:
+                    self.plugin_routes[plugin.id] = added_routes
+
+                # Force regenerate OpenAPI schema so Swagger UI shows newly added routes
+                try:
+                    if hasattr(self.app, 'openapi_schema'):
+                        self.app.openapi_schema = None
+                except Exception:
+                    pass
             
             # Сохраняем в реестр
-            self.plugins[plugin.id] = plugin
+            try:
+                async with self._lock:
+                    self.plugins[plugin.id] = plugin
+            except Exception:
+                self.plugins[plugin.id] = plugin
+            
+            # Сохраняем информацию о плагине в БД
+            await self._save_plugin_to_db(plugin)
             
             logger.info(f"✅ Loaded {plugin_type} plugin: {plugin.name} v{plugin.version}")
             
@@ -465,8 +868,119 @@ class PluginLoader:
         
         plugin = self.plugins[plugin_id]
         try:
+            # Получаем сохранённые данные о роутерах/префиксе плагина
+            saved = self.plugin_routes.get(plugin_id)
+
+            removed_count = 0
+            # Если мы ранее сохранили список route-объектов, удаляем именно их
+            if isinstance(saved, list):
+                routes_to_remove = list(saved)
+                for route in routes_to_remove:
+                    try:
+                        if route in getattr(self.app, 'routes', []):
+                            self.app.routes.remove(route)
+                            removed_count += 1
+                            logger.debug(f"  ✅ Removed route from app.routes: {getattr(route, 'path', 'unknown')}")
+                        elif hasattr(self.app, 'router') and hasattr(self.app.router, 'routes') and route in self.app.router.routes:
+                            self.app.router.routes.remove(route)
+                            removed_count += 1
+                            logger.debug(f"  ✅ Removed route from router.routes: {getattr(route, 'path', 'unknown')}")
+                    except Exception as e:
+                        logger.debug(f"  ⚠️ Could not remove saved route {getattr(route, 'path', 'unknown')}: {e}")
+
+                # Очищаем сохранённые данные
+                try:
+                    async with self._lock:
+                        if plugin_id in self.plugin_routes:
+                            del self.plugin_routes[plugin_id]
+                except Exception:
+                    if plugin_id in self.plugin_routes:
+                        del self.plugin_routes[plugin_id]
+
+                if removed_count == 0:
+                    logger.warning(f"⚠️ No saved routes removed for plugin {plugin_id}")
+                else:
+                    logger.info(f"🗑️ Removed {removed_count} saved route(s) for plugin {plugin_id}")
+
+                # Обновляем OpenAPI схему
+                if hasattr(self.app, 'openapi_schema'):
+                    self.app.openapi_schema = None
+                    logger.debug(f"  🔄 Cleared OpenAPI schema cache for Swagger update")
+
+            # Если сохранено как префикс (устаревший формат), использовать прежнюю логику
+            elif isinstance(saved, str) and saved:
+                prefix = saved
+                # Safety: do not remove core application routes mounted at "/api"
+                if prefix == "/api":
+                    logger.info(f"⚠️ Skipping route removal for infrastructure prefix {prefix}")
+                    routes_to_remove = []
+                else:
+                    routes_to_remove = []
+
+                # Проверяем app.routes (основной список роутов)
+                for route in list(self.app.routes):
+                    route_path = getattr(route, 'path', '')
+                    if route_path and route_path.startswith(prefix):
+                        routes_to_remove.append(route)
+                        logger.debug(f"  🗑️ Found route to remove: {route_path}")
+
+                # Также проверяем app.router.routes (роутеры могут быть вложены)
+                if hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
+                    for route in list(self.app.router.routes):
+                        route_path = getattr(route, 'path', '')
+                        if route_path and route_path.startswith(prefix):
+                            if route not in routes_to_remove:
+                                routes_to_remove.append(route)
+                                logger.debug(f"  🗑️ Found route in router.routes: {route_path}")
+
+                for route in routes_to_remove:
+                    try:
+                        if route in self.app.routes:
+                            self.app.routes.remove(route)
+                            removed_count += 1
+                            logger.debug(f"  ✅ Removed route from app.routes: {getattr(route, 'path', 'unknown')}")
+                        elif hasattr(self.app, 'router') and hasattr(self.app.router, 'routes') and route in self.app.router.routes:
+                            self.app.router.routes.remove(route)
+                            removed_count += 1
+                            logger.debug(f"  ✅ Removed route from router.routes: {getattr(route, 'path', 'unknown')}")
+                    except (ValueError, AttributeError) as e:
+                        logger.debug(f"  ⚠️ Could not remove route {getattr(route, 'path', 'unknown')}: {e}")
+
+                if removed_count == 0:
+                    logger.warning(f"⚠️ No routes found to remove for prefix {prefix}")
+                else:
+                    logger.info(f"🗑️ Removed {removed_count} route(s) for plugin {plugin_id}")
+
+                try:
+                    async with self._lock:
+                        if plugin_id in self.plugin_routes:
+                            del self.plugin_routes[plugin_id]
+                except Exception:
+                    if plugin_id in self.plugin_routes:
+                        del self.plugin_routes[plugin_id]
+
+                if hasattr(self.app, 'openapi_schema'):
+                    self.app.openapi_schema = None
+                    logger.debug(f"  🔄 Cleared OpenAPI schema cache for Swagger update")
+
+            else:
+                logger.warning(f"⚠️ No route info found for plugin {plugin_id}, routes may not be removed")
+            
+            # Вызываем on_unload плагина
             await plugin.on_unload()
-            del self.plugins[plugin_id]
+            
+            # Удаляем из реестра
+            try:
+                async with self._lock:
+                    if plugin_id in self.plugins:
+                        del self.plugins[plugin_id]
+            except Exception:
+                if plugin_id in self.plugins:
+                    del self.plugins[plugin_id]
+            
+            # Обновляем статус в БД
+            await self._update_plugin_loaded_status(plugin_id, loaded=False)
+            
             logger.info(f"✅ Unloaded plugin: {plugin.name}")
         except Exception as e:
             logger.error(f"❌ Error unloading plugin {plugin_id}: {e}", exc_info=True)
@@ -496,7 +1010,548 @@ class PluginLoader:
                 "name": p.name,
                 "version": p.version,
                 "description": p.description,
-                "type": "internal"
+                "type": getattr(p, 'type', 'internal') or 'internal',
+                "loaded": True  # runtime список — значит загружен
             }
             for p in self.plugins.values()
         ]
+    
+    async def install_from_url(self, url: str) -> Dict[str, Any]:
+        """
+        Установить плагин из URL (zip/tar.gz файл).
+        
+        Args:
+            url: URL к архиву плагина
+            
+        Returns:
+            Dict с результатом установки
+        """
+        import httpx
+        
+        if not self.external_plugins_dir:
+            raise ValueError("PLUGINS_DIR not configured")
+        
+        os.makedirs(self.external_plugins_dir, exist_ok=True)
+        
+        logger.info(f"📥 Downloading plugin from {url}")
+        
+        try:
+            # Download file
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.get(url, follow_redirects=True)
+                response.raise_for_status()
+            
+            # Determine file type from URL or content-type
+            filename = url.split('/')[-1].split('?')[0]
+            if not filename.endswith(('.zip', '.tar.gz', '.tgz')):
+                content_type = response.headers.get('content-type', '')
+                if 'zip' in content_type:
+                    filename += '.zip'
+                else:
+                    filename += '.tar.gz'
+            
+            # Save to temp file
+            temp_path = os.path.join(tempfile.gettempdir(), filename)
+            with open(temp_path, 'wb') as f:
+                f.write(response.content)
+            
+            # Extract to plugins dir and capture any newly loaded plugin ids
+            before = set(self.plugins.keys())
+            if filename.endswith('.zip'):
+                await self._load_external_archive(temp_path, 'zip')
+            else:
+                await self._load_external_archive(temp_path, 'tar')
+            after = set(self.plugins.keys())
+            new = list(after - before)
+            
+            # Install dependencies for newly loaded plugins
+            deps_results = {}
+            for plugin_id in new:
+                plugin_path = os.path.join(self.external_plugins_dir, plugin_id)
+                if os.path.isdir(plugin_path):
+                    deps_result = await asyncio.to_thread(self._install_plugin_dependencies, plugin_path, plugin_id)
+                    deps_results[plugin_id] = deps_result
+
+            logger.info(f"✅ Plugin installed from {url}")
+            res: Dict[str, Any] = {'status': 'installed', 'source': url}
+            if new:
+                res['plugin_ids'] = new
+                if len(new) == 1:
+                    res['plugin_id'] = new[0]
+            if deps_results:
+                res['dependencies'] = deps_results
+            return res
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to install plugin from URL: {e}", exc_info=True)
+            raise
+    
+    async def install_from_local(self, path: str) -> Dict[str, Any]:
+        """
+        Установить плагин из локального файла/папки.
+        
+        Args:
+            path: Путь к файлу или папке плагина
+            
+        Returns:
+            Dict с результатом установки
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(f'Plugin path not found: {path}')
+        
+        if not self.external_plugins_dir:
+            raise ValueError('PLUGINS_DIR not configured')
+        
+        os.makedirs(self.external_plugins_dir, exist_ok=True)
+        
+        logger.info(f'📁 Installing plugin from {path}')
+        
+        try:
+            if os.path.isdir(path):
+                # Copy directory
+                plugin_name = os.path.basename(path)
+                dest_path = os.path.join(self.external_plugins_dir, plugin_name)
+                
+                if os.path.exists(dest_path):
+                    shutil.rmtree(dest_path)
+                
+                before = set(self.plugins.keys())
+                shutil.copytree(path, dest_path)
+                
+                # Install dependencies
+                deps_result = await asyncio.to_thread(self._install_plugin_dependencies, dest_path, plugin_name)
+                
+                await self._load_external_package(dest_path, plugin_name)
+                after = set(self.plugins.keys())
+                new = list(after - before)
+                
+            elif path.endswith('.py'):
+                # Copy Python file
+                filename = os.path.basename(path)
+                dest_path = os.path.join(self.external_plugins_dir, filename)
+                before = set(self.plugins.keys())
+                shutil.copy2(path, dest_path)
+                await self._load_external_python_file(dest_path)
+                after = set(self.plugins.keys())
+                new = list(after - before)
+                
+            elif path.endswith('.zip'):
+                before = set(self.plugins.keys())
+                await self._load_external_archive(path, 'zip')
+                after = set(self.plugins.keys())
+                new = list(after - before)
+                
+            elif path.endswith(('.tar.gz', '.tgz')):
+                before = set(self.plugins.keys())
+                await self._load_external_archive(path, 'tar')
+                after = set(self.plugins.keys())
+                new = list(after - before)
+            else:
+                raise ValueError(f'Unsupported file type: {path}')
+            
+            logger.info(f'✅ Plugin installed from {path}')
+            res: Dict[str, Any] = {'status': 'installed', 'source': path}
+            if 'new' in locals() and new:
+                res['plugin_ids'] = new
+                if len(new) == 1:
+                    res['plugin_id'] = new[0]
+            return res
+            
+        except Exception as e:
+            logger.error(f'❌ Failed to install plugin from local path: {e}', exc_info=True)
+            raise
+
+    def _install_plugin_dependencies(self, plugin_path: str, plugin_id: str) -> Dict[str, Any]:
+        """
+        Установить зависимости плагина из requirements.txt.
+        
+        Args:
+            plugin_path: Путь к директории плагина
+            plugin_id: ID плагина
+            
+        Returns:
+            Dict с результатом установки зависимостей
+        """
+        requirements_file = os.path.join(plugin_path, 'requirements.txt')
+        
+        if not os.path.exists(requirements_file):
+            logger.debug(f"ℹ️ No requirements.txt found for plugin {plugin_id}")
+            return {'status': 'skipped', 'reason': 'no_requirements'}
+        
+        try:
+            logger.info(f"📦 Installing dependencies for plugin {plugin_id}")
+            
+            # Используем pip для установки зависимостей
+            # --user позволяет устанавливать без sudo
+            # --no-warn-script-location убирает предупреждения
+            result = subprocess.run(
+                [sys.executable, '-m', 'pip', 'install', '-r', requirements_file, '--user', '--no-warn-script-location'],
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 минут таймаут
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"✅ Dependencies installed for plugin {plugin_id}")
+                return {'status': 'installed', 'output': result.stdout}
+            else:
+                logger.error(f"❌ Failed to install dependencies for plugin {plugin_id}: {result.stderr}")
+                return {'status': 'failed', 'error': result.stderr}
+                
+        except subprocess.TimeoutExpired:
+            logger.error(f"❌ Dependency installation timeout for plugin {plugin_id}")
+            return {'status': 'failed', 'error': 'timeout'}
+        except Exception as e:
+            logger.error(f"❌ Error installing dependencies for plugin {plugin_id}: {e}", exc_info=True)
+            return {'status': 'failed', 'error': str(e)}
+
+    def install_from_git(self, git_url: str) -> Dict[str, Any]:
+        """
+        Синхронная установка плагина из git-репозитория.
+
+        Этот метод выполняет `git clone` в временную папку, ищет `plugin.json`,
+        копирует содержимое в `PLUGINS_DIR` и пытается загрузить плагин.
+
+        Вызывается через `asyncio.to_thread(...)` в маршрутах.
+        """
+        if not self.external_plugins_dir:
+            raise ValueError('PLUGINS_DIR not configured')
+
+        os.makedirs(self.external_plugins_dir, exist_ok=True)
+
+        tmp_clone = tempfile.mkdtemp(prefix='plugin_clone_')
+        try:
+            logger.info(f"📥 Cloning plugin from git {git_url}")
+            subprocess.check_call(["git", "clone", "--depth", "1", git_url, tmp_clone])
+
+            # Найти plugin.json — может быть в корне или в единственной вложенной папке
+            plugin_root = tmp_clone
+            if not os.path.exists(os.path.join(plugin_root, 'plugin.json')):
+                entries = [e for e in os.listdir(tmp_clone) if not e.startswith('.')]
+                if len(entries) == 1:
+                    candidate = os.path.join(tmp_clone, entries[0])
+                    if os.path.exists(os.path.join(candidate, 'plugin.json')):
+                        plugin_root = candidate
+
+            plugin_json = os.path.join(plugin_root, 'plugin.json')
+            if not os.path.exists(plugin_json):
+                raise FileNotFoundError('plugin.json not found in cloned repository')
+
+            with open(plugin_json, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+
+            plugin_id = metadata.get('id') or os.path.basename(git_url).replace('.git', '')
+            dest_path = os.path.join(self.external_plugins_dir, plugin_id)
+
+            if os.path.exists(dest_path):
+                shutil.rmtree(dest_path)
+
+            shutil.copytree(plugin_root, dest_path)
+            
+            # Устанавливаем зависимости плагина
+            deps_result = self._install_plugin_dependencies(dest_path, plugin_id)
+
+            # Загружаем плагин — запускаем корутину в новом цикле событий в этом потоке
+            import asyncio as _asyncio
+            _asyncio.run(self._load_external_package(dest_path, plugin_id))
+
+            logger.info(f"✅ Plugin installed from git {git_url}")
+            result = {'status': 'installed', 'source': git_url, 'plugin_id': plugin_id}
+            if deps_result.get('status') == 'installed':
+                result['dependencies'] = 'installed'
+            elif deps_result.get('status') == 'failed':
+                result['dependencies'] = 'failed'
+                result['dependencies_error'] = deps_result.get('error')
+            return result
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Git clone failed: {e}", exc_info=True)
+            raise
+        finally:
+            shutil.rmtree(tmp_clone, ignore_errors=True)
+    
+    async def _get_plugin_runtime_mode(self, plugin_id: str) -> str:
+        """
+        Получить режим работы плагина.
+        
+        Args:
+            plugin_id: ID плагина
+            
+        Returns:
+            Режим работы: "in-process", "microservice", "hybrid" или "in-process" по умолчанию
+        """
+        try:
+            async with get_session() as db:
+                existing_q = await db.execute(select(Plugin).where(Plugin.id == plugin_id))
+                existing = existing_q.scalar_one_or_none()
+                
+                if existing and hasattr(existing, 'runtime_mode') and existing.runtime_mode:
+                    return existing.runtime_mode
+                
+                # Проверяем метаданные плагина
+                if plugin_id in self.plugins:
+                    plugin = self.plugins[plugin_id]
+                    if hasattr(plugin, 'manifest') and plugin.manifest:
+                        runtime_mode = plugin.manifest.get('runtime_mode')
+                        if runtime_mode:
+                            return runtime_mode
+                    # Проверяем тип плагина
+                    if hasattr(plugin, 'type'):
+                        plugin_type = plugin.type
+                        if plugin_type == 'external':
+                            return 'microservice'
+                        elif plugin_type == 'internal':
+                            return 'in_process'
+                
+                # По умолчанию - in_process
+                return 'in_process'
+        except Exception as e:
+            logger.debug(f"⚠️ Failed to get runtime mode for plugin {plugin_id}: {e}")
+            return 'in-process'
+    
+    async def _get_plugin_tables(self, plugin_id: str) -> List[str]:
+        """
+        Получить список таблиц, принадлежащих плагину.
+        
+        Args:
+            plugin_id: ID плагина
+            
+        Returns:
+            Список имен таблиц плагина
+        """
+        # Маппинг известных плагинов и их таблиц
+        plugin_tables_map = {
+            'client_manager': ['clients', 'command_logs', 'enrollments', 'terminal_audit'],
+            # Добавьте другие плагины по мере необходимости
+        }
+        
+        return plugin_tables_map.get(plugin_id, [])
+    
+    async def _drop_plugin_tables(self, plugin_id: str, drop_data: bool = False) -> List[str]:
+        """
+        Удалить таблицы плагина из БД.
+        
+        Args:
+            plugin_id: ID плагина
+            drop_data: Если True, удаляет таблицы с данными. Если False, только логирует предупреждение.
+            
+        Returns:
+            Список удаленных таблиц
+        """
+        # Проверяем режим работы плагина
+        runtime_mode = await self._get_plugin_runtime_mode(plugin_id)
+        
+        # Для microservice плагинов НЕ удаляем таблицы (они в своей БД)
+        if runtime_mode == 'microservice':
+            logger.info(
+                f"ℹ️ Plugin {plugin_id} runs in microservice mode. "
+                f"Tables are managed by the plugin service itself, not dropping."
+            )
+            return []
+        
+        tables = await self._get_plugin_tables(plugin_id)
+        
+        if not tables:
+            logger.debug(f"ℹ️ No tables found for plugin {plugin_id}")
+            return []
+        
+        if not drop_data:
+            logger.warning(
+                f"⚠️ Plugin {plugin_id} has tables in DB: {', '.join(tables)}. "
+                f"Tables are NOT dropped to preserve data. "
+                f"To drop tables, use uninstall with drop_tables=True"
+            )
+            return []
+        
+        dropped_tables = []
+        try:
+            from sqlalchemy import text
+            from .db import engine
+            
+            async with engine.begin() as conn:
+                # Пытаемся удалить каждую таблицу
+                # DROP TABLE IF EXISTS безопасен - не вызовет ошибку, если таблицы нет
+                for table_name in tables:
+                    try:
+                        # Используем IF EXISTS для безопасности
+                        await conn.execute(text(f'DROP TABLE IF EXISTS "{table_name}" CASCADE'))
+                        dropped_tables.append(table_name)
+                        logger.info(f"🗑️ Dropped table: {table_name}")
+                    except Exception as e:
+                        logger.debug(f"ℹ️ Could not drop table {table_name}: {e}")
+            
+            if dropped_tables:
+                logger.info(f"✅ Dropped {len(dropped_tables)} table(s) for plugin {plugin_id}")
+            else:
+                logger.debug(f"ℹ️ No tables were dropped for plugin {plugin_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to drop tables for plugin {plugin_id}: {e}", exc_info=True)
+            # Не прерываем процесс удаления плагина из-за ошибки удаления таблиц
+        
+        return dropped_tables
+    
+    async def uninstall_plugin(self, plugin_id: str, drop_tables: bool = False) -> Dict[str, Any]:
+        """
+        Удалить плагин (из файловой системы).
+        
+        Args:
+            plugin_id: ID плагина
+            drop_tables: Если True, удаляет таблицы плагина из БД (ОПАСНО - удаляет данные!)
+            
+        Returns:
+            Dict с результатом удаления
+        """
+        if not self.external_plugins_dir:
+            raise ValueError('PLUGINS_DIR not configured. Cannot uninstall builtin plugins.')
+        
+        logger.info(f'🗑️ Uninstalling plugin {plugin_id}')
+        
+        # Сначала выгружаем плагин, если он загружен
+        if plugin_id in self.plugins:
+            await self.unload_plugin(plugin_id)
+        
+        # Удаляем таблицы, если запрошено
+        dropped_tables = []
+        if drop_tables:
+            dropped_tables = await self._drop_plugin_tables(plugin_id, drop_data=True)
+        
+        # Find plugin directory
+        plugin_path = os.path.join(self.external_plugins_dir, plugin_id)
+        
+        if not os.path.exists(plugin_path):
+            # Try to find by scanning all plugins
+            for item in os.listdir(self.external_plugins_dir):
+                item_path = os.path.join(self.external_plugins_dir, item)
+                plugin_json = os.path.join(item_path, 'plugin.json')
+                
+                if os.path.exists(plugin_json):
+                    try:
+                        with open(plugin_json, 'r') as f:
+                            metadata = json.load(f)
+                        if metadata.get('id') == plugin_id:
+                            plugin_path = item_path
+                            break
+                    except Exception:
+                        continue
+        
+        if not os.path.exists(plugin_path):
+            raise FileNotFoundError(f'Plugin directory not found: {plugin_id}')
+        
+        try:
+            if os.path.isdir(plugin_path):
+                shutil.rmtree(plugin_path)
+            else:
+                os.remove(plugin_path)
+            
+            result = {'status': 'uninstalled', 'plugin_id': plugin_id}
+            if dropped_tables:
+                result['dropped_tables'] = dropped_tables
+            elif await self._get_plugin_tables(plugin_id):
+                result['warning'] = f"Plugin tables remain in DB. Use drop_tables=True to remove them."
+            
+            logger.info(f'✅ Plugin {plugin_id} uninstalled')
+            return result
+            
+        except Exception as e:
+            logger.error(f'❌ Failed to uninstall plugin: {e}', exc_info=True)
+            raise
+    
+    async def reload_plugin(self, plugin_id: str) -> Dict[str, Any]:
+        """
+        Перезагрузить плагин.
+        
+        Args:
+            plugin_id: ID плагина
+            
+        Returns:
+            Dict с результатом перезагрузки
+        """
+        logger.info(f'🔄 Reloading plugin {plugin_id}')
+        
+        # Find the plugin module
+        module_name = None
+        
+        # Check if it's a builtin plugin
+        try:
+            import core_service.plugins as plugins_package
+            package_name = 'core_service.plugins'
+        except ImportError:
+            try:
+                import plugins as plugins_package
+                package_name = 'plugins'
+            except ImportError:
+                plugins_package = None
+                package_name = None
+        
+        if plugins_package:
+            plugin_modules = list(pkgutil.walk_packages(
+                plugins_package.__path__,
+                prefix=package_name + '.'
+            ))
+            
+            logger.info(f"🔍 Found {len(plugin_modules)} modules in plugins package")
+            
+            for _, mod_name, _ in plugin_modules:
+                # Match by exact id (package name or module name)
+                parts = mod_name.split('.')
+                last_part = parts[-1]
+                second_last = parts[-2] if len(parts) > 1 else ''
+                
+                # Skip helper modules (embed, models, etc.)
+                if last_part in ('embed', 'models', 'utils', 'base'):
+                    continue
+                
+                if last_part == plugin_id or second_last == plugin_id:
+                    module_name = mod_name
+                    logger.debug(f"Matched module {mod_name} for plugin {plugin_id}")
+                    break
+            
+            # If not found yet, try checking plugin_id as package
+            if not module_name:
+                potential_package = f"{package_name}.{plugin_id}"
+                logger.debug(f"Trying to import {potential_package}")
+                try:
+                    importlib.import_module(potential_package)
+                    module_name = potential_package
+                    logger.debug(f"Successfully imported {potential_package}")
+                except ImportError as ie:
+                    logger.debug(f"Failed to import {potential_package}: {ie}")
+        
+        if module_name:
+            # If plugin is already loaded, unload first to avoid duplicate routes/instances
+            if plugin_id in self.plugins:
+                try:
+                    await self.unload_plugin(plugin_id)
+                except Exception as e:
+                    logger.debug(f"⚠️ Failed to unload before reload: {e}")
+
+            # Reload builtin plugin
+            await self.load_plugin(module_name, plugin_type='builtin')
+            logger.info(f'✅ Reloaded builtin plugin {plugin_id}')
+            return {'status': 'reloaded', 'plugin_id': plugin_id, 'type': 'builtin'}
+        
+        # Try external plugins
+        if self.external_plugins_dir:
+            # If plugin is already loaded, unload first
+            if plugin_id in self.plugins:
+                try:
+                    await self.unload_plugin(plugin_id)
+                except Exception as e:
+                    logger.debug(f"⚠️ Failed to unload before reload (external): {e}")
+
+            await self._load_external_plugins()
+
+            if plugin_id in self.plugins:
+                logger.info(f'✅ Reloaded external plugin {plugin_id}')
+                return {'status': 'reloaded', 'plugin_id': plugin_id, 'type': 'external'}
+        
+        raise ValueError(f'Plugin {plugin_id} not found')
+    
+    def __del__(self):
+        """Cleanup temp directory on destruction."""
+        try:
+            if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
