@@ -10,12 +10,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from pydantic import BaseModel
 
-try:
-    from ..db import get_session
-    from ..models import Device, PluginBinding, IntentMapping
-except ImportError:
-    from db import get_session
-    from models import Device, PluginBinding, IntentMapping
+from ..db import get_session
+from ..models import Device, PluginBinding, IntentMapping
 
 router = APIRouter()
 

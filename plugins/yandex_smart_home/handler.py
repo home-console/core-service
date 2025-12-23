@@ -14,15 +14,10 @@ import logging
 
 from home_console_sdk.plugin import InternalPluginBase
 
-# Импорты для работы с внутренними устройствами
-try:
-    from ..db import get_session
-    from ..models import Device, PluginBinding, IntentMapping
-    from sqlalchemy import select
-except ImportError:
-    from db import get_session
-    from models import Device, PluginBinding, IntentMapping
-    from sqlalchemy import select
+# Импорты для работы с внутренними устройствами (берём из core_service root)
+from ...db import get_session
+from ...models import Device, PluginBinding, IntentMapping
+from sqlalchemy import select
 
 
 AUTH_SERVICE_BASE = os.getenv('AUTH_SERVICE_BASE', 'http://127.0.0.1:8000')

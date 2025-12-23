@@ -1,149 +1,156 @@
 """
-Authentication and JWT utilities.
+Authentication utilities for Home Console.
+Provides password hashing, JWT token creation and validation functions.
 """
 import os
-import json
-import time
-import base64
-import hmac
-import hashlib
-import uuid
-from typing import Dict, Optional
+import jwt
+import bcrypt
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from passlib.context import CryptContext
+
+
+# Initialize password context for hashing.
+# bcrypt_sha256 позволяет не упираться в 72-байтовый лимит исходного bcrypt
+# (Passlib сначала хеширует SHA-256, затем bcrypt), что избегает ValueError.
+pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
+
+
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt."""
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a plain password against its hash."""
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception:
+        return False
+
+
+def verify_password_hash(password: str, password_hash: str) -> bool:
+    """Verify password against hash (alias for verify_password)."""
+    return verify_password(password, password_hash)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Create JWT access token."""
+    # Secret key for JWT (should come from environment)
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "home_console_default_secret")
+    JWT_ALGORITHM = "HS256"
+    
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        # Default expiration: 24 hours
+        ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode.update({"exp": expire, "type": "access"})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+
+def create_refresh_token(data: dict):
+    """Create JWT refresh token."""
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "home_console_default_secret")
+    JWT_ALGORITHM = "HS256"
+    
+    REFRESH_TOKEN_EXPIRE_DAYS = 7  # 7 days
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+
+def verify_token(token: str) -> Optional[Dict[str, Any]]:
+    """Verify JWT token and return payload."""
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "home_console_default_secret")
+    JWT_ALGORITHM = "HS256"
+    
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.JWTError:
+        return None
+
+
+def get_password_hash(password: str) -> str:
+    """Get hash for a password (alias for hash_password)."""
+    return hash_password(password)
 
 
 def generate_jwt_token(
-    subject: str,
-    audience: str = "client_manager",
-    issuer: str = "core_service",
-    expires_in: int = 120
+    subject: str = "admin",
+    expires_delta: Optional[timedelta] = None,
+    permissions: Optional[list[str]] = None,
+    issuer: Optional[str] = None,
+    audience: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Generate a JWT token for admin authentication.
+    Унифицированная генерация JWT для внутренних запросов.
     
-    Supports both HS256 (shared secret) and RS256 (private key) algorithms.
-    Configuration via environment variables:
-    - ADMIN_JWT_SECRET: Shared secret for HS256
-    - ADMIN_JWT_ALG: Algorithm (HS256 or RS256), defaults to HS256
-    - ADMIN_JWT_PRIVATE_KEY or ADMIN_JWT_PRIVATE_KEY_FILE: Private key for RS256
-    
-    Args:
-        subject: JWT subject (sub claim)
-        audience: JWT audience (aud claim)
-        issuer: JWT issuer (iss claim)
-        expires_in: Token expiration time in seconds
-        
-    Returns:
-        JWT token string
-        
-    Raises:
-        ValueError: If no authentication secret is configured
+    - Если задан ADMIN_TOKEN, предпочтём его (но вернём как Bearer).
+    - По умолчанию HS256 с ключом из ADMIN_JWT_SECRET или JWT_SECRET_KEY.
+    - Можно добавить произвольные claims через extra.
     """
-    admin_jwt_secret = os.getenv('ADMIN_JWT_SECRET', '')
-    if not admin_jwt_secret:
-        raise ValueError("ADMIN_JWT_SECRET not configured")
+    # Static token fallback (used only in get_admin_headers)
+    admin_token = os.getenv("ADMIN_TOKEN")
+    if admin_token:
+        return admin_token
     
-    alg = os.getenv('ADMIN_JWT_ALG', 'HS256').upper()
+    secret = (
+        os.getenv("ADMIN_JWT_SECRET")
+        or os.getenv("JWT_SECRET_KEY")
+        or "home_console_default_secret"
+    )
+    alg = os.getenv("ADMIN_JWT_ALG", "HS256").upper()
     
-    # Try PyJWT for RS256/HS256 handling
-    try:
-        import jwt as _pyjwt
-    except ImportError:
-        _pyjwt = None
-    
-    if alg == 'RS256' and _pyjwt:
-        # Read private key from env or file
-        priv = os.getenv('ADMIN_JWT_PRIVATE_KEY')
-        if not priv:
-            priv_file = os.getenv('ADMIN_JWT_PRIVATE_KEY_FILE')
-            if priv_file:
-                try:
-                    with open(priv_file, 'r') as f:
-                        priv = f.read()
-                except Exception:
-                    priv = None
-        
-        if not priv:
-            # Fallback to HS256 if no private key provided
-            alg = 'HS256'
-        else:
-            jwt_payload = {
-                'iss': issuer,
-                'sub': subject,
-                'aud': audience,
-                'iat': int(time.time()),
-                'exp': int(time.time()) + expires_in,
-                'jti': str(uuid.uuid4())
-            }
-            return _pyjwt.encode(jwt_payload, priv, algorithm='RS256')
-    
-    # HS256 implementation (shared secret)
-    def _b64u(data: bytes) -> str:
-        """Base64 URL-safe encoding without padding."""
-        return base64.urlsafe_b64encode(data).rstrip(b"=").decode('utf-8')
-    
-    header = {'alg': 'HS256', 'typ': 'JWT'}
-    jwt_claims = {
-        'iss': issuer,
-        'sub': subject,
-        'aud': audience,
-        'iat': int(time.time()),
-        'exp': int(time.time()) + expires_in,
-        'jti': str(uuid.uuid4())
+    # Support PEM key passed via env ADMIN_JWT_PRIVATE_KEY / _FILE (optional)
+    key_from_env = os.getenv("ADMIN_JWT_PRIVATE_KEY")
+    if not key_from_env:
+        key_file = os.getenv("ADMIN_JWT_PRIVATE_KEY_FILE")
+        if key_file and os.path.exists(key_file):
+            with open(key_file, "r", encoding="utf-8") as fh:
+                key_from_env = fh.read()
+    if key_from_env:
+        secret = key_from_env
+
+    now = datetime.utcnow()
+    expire = now + (expires_delta or timedelta(hours=24))
+
+    payload: Dict[str, Any] = {
+        "sub": subject,
+        "iat": now,
+        "nbf": now,
+        "exp": expire,
     }
-    
-    header_b = _b64u(json.dumps(header).encode('utf-8'))
-    payload_b = _b64u(json.dumps(jwt_claims).encode('utf-8'))
-    signing = (header_b + '.' + payload_b).encode('utf-8')
-    sig = hmac.new(admin_jwt_secret.encode('utf-8'), signing, hashlib.sha256).digest()
-    sig_b = _b64u(sig)
-    
-    return header_b + '.' + payload_b + '.' + sig_b
+
+    if issuer or os.getenv("JWT_ISSUER"):
+        payload["iss"] = issuer or os.getenv("JWT_ISSUER")
+    if audience or os.getenv("JWT_AUDIENCE"):
+        payload["aud"] = audience or os.getenv("JWT_AUDIENCE")
+    if permissions:
+        payload["permissions"] = permissions
+    if extra:
+        payload.update(extra)
+
+    return jwt.encode(payload, secret, algorithm=alg)
 
 
 def get_admin_headers() -> Dict[str, str]:
     """
-    Get admin authentication headers for internal API calls.
-    
-    Supports:
-    - JWT token generation (ADMIN_JWT_SECRET)
-    - Simple bearer token (ADMIN_TOKEN)
-    
-    Returns:
-        Dictionary with Authorization header
+    Возвращает заголовки для внутренних запросов:
+    - Если ADMIN_TOKEN задан, используем его.
+    - Иначе генерируем JWT через generate_jwt_token().
     """
-    # Try JWT first
-    admin_jwt_secret = os.getenv('ADMIN_JWT_SECRET', '')
-    if admin_jwt_secret:
-        try:
-            token = generate_jwt_token(subject='admin')
-            return {'Authorization': f'Bearer {token}'}
-        except Exception:
-            pass
-    
-    # Fallback to ADMIN_TOKEN
-    admin_token = os.getenv('ADMIN_TOKEN', '')
-    if admin_token:
-        return {'Authorization': f'Bearer {admin_token}'}
-    
-    return {}
-
-
-def require_admin_auth() -> Dict[str, str]:
-    """
-    Get admin headers, raising an exception if no auth is configured.
-    
-    Returns:
-        Dictionary with Authorization header
-        
-    Raises:
-        ValueError: If no admin authentication is configured
-    """
-    admin_token = os.getenv("ADMIN_TOKEN", "")
-    admin_jwt_secret = os.getenv("ADMIN_JWT_SECRET", "")
-    admin_jwt_alg = os.getenv('ADMIN_JWT_ALG', '').upper()
-    admin_jwt_priv = os.getenv('ADMIN_JWT_PRIVATE_KEY') or os.getenv('ADMIN_JWT_PRIVATE_KEY_FILE')
-    
-    if not admin_token and not admin_jwt_secret and not (admin_jwt_alg == 'RS256' and admin_jwt_priv):
-        raise ValueError("Server ADMIN_TOKEN, ADMIN_JWT_SECRET, or RS256 private key not configured")
-    
-    return get_admin_headers()
+    token = os.getenv("ADMIN_TOKEN")
+    if not token:
+        token = generate_jwt_token()
+    return {"Authorization": f"Bearer {token}"}

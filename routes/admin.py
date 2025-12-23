@@ -16,12 +16,9 @@ try:
     from ..db import get_session
     from ..plugins.client_manager.models import TerminalAudit
 except ImportError:
-    try:
-        from db import get_session
-        from plugins.client_manager.models import TerminalAudit
-    except ImportError:
-        # Fallback if plugin not loaded
-        TerminalAudit = None
+    # Fallback if plugin not loaded
+    TerminalAudit = None
+    get_session = None  # type: ignore
 
 router = APIRouter()
 

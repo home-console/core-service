@@ -16,14 +16,9 @@ from sqlalchemy import select
 from home_console_sdk.plugin import InternalPluginBase
 
 # Импорты для работы с внутренними устройствами
-try:
-    from ...db import get_session
-    from ...models import Device, PluginBinding, IntentMapping
-    from sqlalchemy import select
-except ImportError:
-    from db import get_session
-    from models import Device, PluginBinding, IntentMapping
-    from sqlalchemy import select
+from ...db import get_session
+from ...models import Device, PluginBinding, IntentMapping
+from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
 
@@ -31,60 +26,62 @@ logger = logging.getLogger(__name__)
 AUTH_SERVICE_BASE = os.getenv('AUTH_SERVICE_BASE', 'http://auth-service:8000')
 INTERNAL_TOKEN = os.getenv('INTERNAL_SERVICE_TOKEN', 'internal-service-token')
 
-
+# AuthServiceClient класс для совместимости
 class AuthServiceClient:
     """Клиент для взаимодействия с сервисом авторизации."""
-    
+
     @staticmethod
-    def call_auth_service(endpoint: str, method: str = 'GET', data: Dict[str, Any] = None, 
+    def call_auth_service(endpoint: str, method: str = 'GET', data: Dict[str, Any] = None,
                          headers: Dict[str, str] = None) -> Dict[str, Any]:
         """
         Вызвать метод сервиса авторизации.
-        
+
         Args:
             endpoint: API endpoint (например, /api/tokens/cloud/yandex)
             method: HTTP метод
             data: Данные для POST/PUT запросов
             headers: Дополнительные заголовки
-        
+
         Returns:
             Ответ от сервиса авторизации
         """
         url = urljoin(AUTH_SERVICE_BASE, endpoint)
         parsed = http.client.urlsplit(url)
-        
+
         conn_class = http.client.HTTPSConnection if parsed.scheme == 'https' else http.client.HTTPConnection
         conn = conn_class(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80), timeout=10)
-        
+
         try:
             req_headers = {"Authorization": f"Bearer {INTERNAL_TOKEN}"}
             if headers:
                 req_headers.update(headers)
-            
+
             if data:
                 req_headers["Content-Type"] = "application/json"
                 body = json.dumps(data).encode('utf-8')
             else:
                 body = None
-            
+
             conn.request(method.upper(), parsed.path, body=body, headers=req_headers)
             resp = conn.getresponse()
             response_data = resp.read()
             text = response_data.decode('utf-8') if response_data else ''
-            
+
             if not (200 <= resp.status < 300):
                 raise HTTPException(
-                    status_code=resp.status, 
+                    status_code=resp.status,
                     detail=f'Auth service error: {resp.status} {text}'
                 )
-            
+
             return json.loads(text) if text else {}
-            
+
         finally:
             try:
                 conn.close()
             except:
                 pass
+
+
 
 
 class YandexAuthManager:

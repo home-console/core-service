@@ -13,18 +13,11 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from typing import Optional
 
-try:
-    from ..db import get_session
-    from ..models import Plugin, PluginVersion, PluginInstallJob
-    from ..utils.http_client import _http_json
-    from ..utils.auth import generate_jwt_token
-    from ..plugin_registry import external_plugin_registry
-except ImportError:
-    from db import get_session
-    from models import Plugin, PluginVersion, PluginInstallJob
-    from utils.http_client import _http_json
-    from utils.auth import generate_jwt_token
-    from plugin_registry import external_plugin_registry
+from ..db import get_session
+from ..models import Plugin, PluginVersion, PluginInstallJob
+from ..utils.http_client import _http_json
+from ..utils.auth import generate_jwt_token
+from ..plugin_registry import external_plugin_registry
 
 import logging
 import uuid

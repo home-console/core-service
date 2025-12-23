@@ -8,10 +8,7 @@ from datetime import datetime
 from sqlalchemy import Column, String, Integer, DateTime, Text
 
 # Импортируем Base из core db
-try:
-    from ...db import Base
-except ImportError:
-    from db import Base
+from ...db import Base
 
 
 class Client(Base):

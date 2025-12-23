@@ -463,16 +463,17 @@ def create_admin_app() -> FastAPI:
     
     # ============= Mount Routers =============
     try:
-        from .routes import devices, plugins, admin
-        
+        from .routes import devices, plugins, admin, auth
+
         # Mount core routes (only device management)
         app.include_router(admin.router, tags=["admin"])
         app.include_router(devices.router, prefix="/api", tags=["devices"])
         app.include_router(plugins.router, prefix="/api", tags=["plugins"])
-        
+        app.include_router(auth.router, prefix="/api", tags=["auth"])
+
         # Client, files, and enrollments routes are now loaded as plugins
         # (client_manager plugin will mount them automatically)
-        
+
         logger.info("✅ Core routes mounted successfully")
     except Exception as e:
         logger.error(f"❌ Failed to mount routes: {e}")

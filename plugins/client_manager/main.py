@@ -18,20 +18,12 @@ import httpx
 from home_console_sdk.plugin import InternalPluginBase
 
 # Импортируем модели плагина
-try:
-    from .models import Client, CommandLog, Enrollment, TerminalAudit
-except ImportError:
-    from models import Client, CommandLog, Enrollment, TerminalAudit
+from .models import Client, CommandLog, Enrollment, TerminalAudit
 
 # Импортируем утилиты из core
-try:
-    from ...utils.http_client import _http_json, _http_multipart_stream, _get_http_client
-    from ...utils.auth import get_admin_headers
-    from ...db import get_session
-except ImportError:
-    from utils.http_client import _http_json, _http_multipart_stream, _get_http_client
-    from utils.auth import get_admin_headers
-    from db import get_session
+from ...utils.http_client import _http_json, _http_multipart_stream, _get_http_client
+from ...utils.auth import get_admin_headers
+from ...db import get_session
 
 
 # Try import embed helper (for embedded mode)

@@ -5,10 +5,7 @@ from sqlalchemy import Column, String, Integer, DateTime, Text, Boolean
 from sqlalchemy import JSON
 
 # Импортируем Base из db.py для совместимости с async engine
-try:
-    from .db import Base
-except ImportError:
-    from db import Base
+from .db import Base
 
 
 # ============= CORE MODELS - Only Device Management =============
@@ -93,5 +90,20 @@ class PluginInstallJob(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
+
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String(128), primary_key=True)
+    username = Column(String(64), unique=True, index=True, nullable=False)
+    email = Column(String(128), unique=True, index=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(32), default="user", nullable=False)  # user, admin, etc.
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_login = Column(DateTime, nullable=True)
+    last_activity = Column(DateTime, nullable=True)
+    # SQLAlchemy reserved attribute name "metadata" -> use column name but safe attribute
+    meta = Column("metadata", JSON, nullable=True)
 
 
