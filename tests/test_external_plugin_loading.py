@@ -3,7 +3,7 @@ import asyncio
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from plugin_loader import PluginLoader
+from core_service.plugin_system import PluginLoader
 
 
 def test_external_plugin_loading_minimal():

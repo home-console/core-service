@@ -79,13 +79,15 @@ print("🔵 app.py: Importing core modules...")
 try:
     from .db import engine, get_session, AsyncSessionLocal
     from .models import Base
-    from .plugin_loader import PluginLoader
-    from .plugin_registry import external_plugin_registry
-    from .plugin_mode_manager import init_plugin_mode_manager
-    from .plugin_config import init_plugin_config_manager
-    from .plugin_lifecycle_manager import init_plugin_lifecycle_manager
-    from .plugin_security_manager import init_plugin_security_manager
-    from .plugin_dependency_manager import init_plugin_dependency_manager
+    from .plugin_system import PluginLoader
+    from .plugin_system.registry import external_plugin_registry
+    from .plugin_system.managers import (
+        init_plugin_mode_manager,
+        init_plugin_config_manager,
+        init_plugin_lifecycle_manager,
+        init_plugin_security_manager,
+        init_plugin_dependency_manager,
+    )
     from .health_monitor import HealthMonitor
     print("✅ app.py: Core modules imported")
 except ImportError as e:
@@ -403,11 +405,13 @@ async def lifespan(app: FastAPI):
 
             # Initialize plugin managers
             try:
-                from .plugin_mode_manager import init_plugin_mode_manager
-                from .plugin_config import init_plugin_config_manager
-                from .plugin_lifecycle_manager import init_plugin_lifecycle_manager
-                from .plugin_security_manager import init_plugin_security_manager
-                from .plugin_dependency_manager import init_plugin_dependency_manager
+                from .plugin_system.managers import (
+                    init_plugin_mode_manager,
+                    init_plugin_config_manager,
+                    init_plugin_lifecycle_manager,
+                    init_plugin_security_manager,
+                    init_plugin_dependency_manager,
+                )
 
                 plugin_mode_manager = init_plugin_mode_manager(plugin_loader)
                 plugin_config_manager = init_plugin_config_manager()

@@ -17,7 +17,7 @@ from ..db import get_session
 from ..models import Plugin, PluginVersion, PluginInstallJob
 from ..utils.http_client import _http_json
 from ..utils.auth import generate_jwt_token
-from ..plugin_registry import external_plugin_registry
+from ..plugin_system.registry import external_plugin_registry
 
 import logging
 import uuid
@@ -570,7 +570,7 @@ async def reload_plugin(plugin_id: str, request: Request):
                 if hasattr(app.state, 'plugin_mode_manager') and current_mode != "unknown":
                     try:
                         mode_manager = app.state.plugin_mode_manager
-                        from ..plugin_mode_manager import PluginMode
+                        from ..plugin_system.managers import PluginMode
                         target_mode = PluginMode(current_mode)
                         # Переключаем в тот же режим для инициализации
                         await mode_manager.switch_mode(plugin_id, target_mode, restart=False)
@@ -722,7 +722,7 @@ async def get_plugin_mode(plugin_id: str, request: Request):
     # Try to use the enhanced PluginModeManager if available
     if hasattr(app.state, 'plugin_mode_manager'):
         try:
-            from ..plugin_mode_manager import PluginMode
+            from ..plugin_system.managers import PluginMode
             mode_manager = app.state.plugin_mode_manager
             status = await mode_manager.get_mode_status(plugin_id)
 
@@ -816,7 +816,7 @@ async def set_plugin_mode(plugin_id: str, payload: Dict[str, Any], request: Requ
     # Try to use the enhanced PluginModeManager if available
     if hasattr(app.state, 'plugin_mode_manager'):
         try:
-            from ..plugin_mode_manager import PluginMode
+            from ..plugin_system.managers import PluginMode
             mode_manager = app.state.plugin_mode_manager
 
             # Convert string to enum
@@ -1030,7 +1030,7 @@ async def get_plugin_config(plugin_id: str, request: Request):
             dependencies_info = []
             if hasattr(app.state, 'plugin_dependency_manager'):
                 try:
-                    from ..plugin_dependency_manager import PluginDependency
+                    from ..plugin_system.managers import PluginDependency
                     dep_manager = app.state.plugin_dependency_manager
                     if plugin_id in dep_manager.plugins:
                         plugin_info = dep_manager.plugins[plugin_id]
@@ -1189,7 +1189,7 @@ async def add_plugin_dependency(plugin_id: str, payload: Dict[str, Any], request
 
     if hasattr(app.state, 'plugin_dependency_manager'):
         try:
-            from ..plugin_dependency_manager import PluginDependency, DependencyType
+            from ..plugin_system.managers import PluginDependency, DependencyType
 
             dep_plugin_id = payload.get('plugin_id')
             version_spec = payload.get('version_spec', '>=0.0.0')

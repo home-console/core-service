@@ -19,8 +19,8 @@ from enum import Enum
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .plugin_loader import PluginLoader
-from .plugin_registry import external_plugin_registry, ExternalPlugin
+from ..loader import PluginLoader
+from ..registry import external_plugin_registry, ExternalPlugin
 
 
 logger = logging.getLogger(__name__)

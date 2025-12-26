@@ -18,7 +18,7 @@ from enum import Enum
 import yaml
 
 from pydantic import BaseModel, ValidationError
-from .plugin_mode_manager import PluginMode
+from .mode import PluginMode
 
 
 logger = logging.getLogger(__name__)
