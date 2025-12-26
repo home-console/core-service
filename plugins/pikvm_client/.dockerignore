@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Virtual Environment
+.venv
+venv
+env
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Environment files
+.env
+
+# Development files
+README.md
+setup.sh
+generate_grpc.py
+
+# OS generated files
+.DS_Store
+Thumbs.db

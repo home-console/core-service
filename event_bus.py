@@ -3,11 +3,29 @@ Event Bus для коммуникации между плагинами.
 Позволяет публиковать и подписываться на события с поддержкой wildcard-паттернов.
 """
 
-from typing import Dict, List, Callable, Any
+from typing import Dict, List, Callable, Any, Optional
+from datetime import datetime
+from collections import deque
 import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class EventLogEntry:
+    """Запись в логе событий."""
+    def __init__(self, event_name: str, data: Dict[str, Any], timestamp: Optional[datetime] = None):
+        self.event_name = event_name
+        self.data = data
+        self.timestamp = timestamp or datetime.utcnow()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Преобразовать в словарь для JSON."""
+        return {
+            "event_name": self.event_name,
+            "data": self.data,
+            "timestamp": self.timestamp.isoformat()
+        }
 
 
 class EventBus:
@@ -37,9 +55,19 @@ class EventBus:
     ```
     """
     
-    def __init__(self):
-        """Инициализация Event Bus."""
+    def __init__(self, max_log_size: int = 1000):
+        """
+        Инициализация Event Bus.
+        
+        Args:
+            max_log_size: Максимальное количество записей в логе событий
+        """
         self.subscribers: Dict[str, List[Callable]] = {}
+        self.event_log: deque = deque(maxlen=max_log_size)
+        self.stats: Dict[str, int] = {
+            "total_events": 0,
+            "events_by_type": {}
+        }
     
     async def emit(self, event_name: str, data: Dict[str, Any]):
         """
@@ -49,7 +77,17 @@ class EventBus:
             event_name: Имя события (например: "device.state_changed")
             data: Данные события (словарь)
         """
-        logger.debug(f"📢 Event: {event_name}, data: {data}")
+        logger.info(f"📢 EVENT EMIT: {event_name}")
+        logger.debug(f"📢 EVENT DATA: {data}")
+        logger.debug(f"📢 SUBSCRIBERS: {list(self.subscribers.keys())}")
+        
+        # Сохранить в лог
+        log_entry = EventLogEntry(event_name, data)
+        self.event_log.append(log_entry)
+        
+        # Обновить статистику
+        self.stats["total_events"] += 1
+        self.stats["events_by_type"][event_name] = self.stats["events_by_type"].get(event_name, 0) + 1
         
         # Найти всех подписчиков с совпадающими паттернами
         for pattern, handlers in self.subscribers.items():
@@ -65,6 +103,50 @@ class EventBus:
                             f"❌ Error in event handler for '{event_name}' (pattern '{pattern}'): {e}",
                             exc_info=True
                         )
+    
+    def get_logs(self, limit: int = 100, event_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Получить последние записи из лога событий.
+        
+        Args:
+            limit: Максимальное количество записей
+            event_filter: Фильтр по имени события (поддерживает wildcards)
+            
+        Returns:
+            Список записей лога
+        """
+        logs = list(self.event_log)
+        
+        # Применить фильтр если указан
+        if event_filter:
+            logs = [
+                entry for entry in logs
+                if self._match_pattern(entry.event_name, event_filter)
+            ]
+        
+        # Вернуть последние N записей
+        return [entry.to_dict() for entry in logs[-limit:]]
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Получить статистику по событиям.
+        
+        Returns:
+            Словарь со статистикой
+        """
+        return {
+            "total_events": self.stats["total_events"],
+            "events_by_type": self.stats["events_by_type"].copy(),
+            "log_size": len(self.event_log),
+            "subscribers_count": sum(len(handlers) for handlers in self.subscribers.values()),
+            "subscribers_patterns": list(self.subscribers.keys())
+        }
+    
+    def clear_log(self):
+        """Очистить лог событий."""
+        self.event_log.clear()
+        self.stats["total_events"] = 0
+        self.stats["events_by_type"] = {}
     
     async def subscribe(self, event_pattern: str, handler: Callable):
         """
@@ -86,6 +168,7 @@ class EventBus:
         Поддерживаемые паттерны:
         - "*" - любое событие
         - "device.*" - события, начинающиеся с "device."
+        - "device.*.toggle" - события вида device.SOMETHING.toggle
         - "device.state_changed" - точное совпадение
         
         Args:
@@ -97,10 +180,21 @@ class EventBus:
         """
         if pattern == "*":
             return True
-        if pattern.endswith(".*"):
-            prefix = pattern[:-2]  # Убираем ".*"
-            return event_name.startswith(f"{prefix}.")
-        return event_name == pattern
+        
+        # Если нет звездочек, то это точное совпадение
+        if "*" not in pattern:
+            return event_name == pattern
+        
+        # Преобразуем паттерн в regex
+        import re
+        # Экранируем специальные символы кроме *
+        escaped = re.escape(pattern)
+        # Заменяем экранированные * на .*
+        regex_pattern = escaped.replace(r"\*", ".*")
+        # Добавляем якоря начала и конца
+        regex_pattern = f"^{regex_pattern}$"
+        
+        return bool(re.match(regex_pattern, event_name))
 
 
 # Глобальный singleton

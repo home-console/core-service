@@ -1,1095 +1,485 @@
 """
-Auth Service Integration - интеграция с системой авторизации.
-Обеспечивает OAuth интеграцию с Яндексом и безопасный обмен токенами.
+Yandex Smart Home Plugin - OAuth integration and device synchronization.
+Refactored to use modular structure.
 """
 import asyncio
 import logging
+import json
 import os
 import http.client
-import json
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
-from urllib.parse import urljoin, urlencode
+from uuid import uuid4
 
-from fastapi import HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi.responses import JSONResponse, RedirectResponse
+
 from sqlalchemy import select
 from home_console_sdk.plugin import InternalPluginBase
 
-# Импорты для работы с внутренними устройствами
-from ...db import get_session
-from ...models import Device, PluginBinding, IntentMapping
-from sqlalchemy import select
+# Import modular components
+from .models import YandexUser
+from .auth.manager import YandexAuthManager
+from .api import YandexAPIClient, parse_last_updated, cfg_get
+from .devices.manager import DeviceManager
+from .state.state_manager import DeviceStateManager
+from .handlers import RouteHandlers, AuthHandler, DeviceHandlers, AliceHandlers, IntentHandlers
+from .service import save_account
+
+# No direct core_service imports - all dependencies via DI
 
 logger = logging.getLogger(__name__)
 
-# Конфигурация сервиса авторизации
-AUTH_SERVICE_BASE = os.getenv('AUTH_SERVICE_BASE', 'http://auth-service:8000')
-INTERNAL_TOKEN = os.getenv('INTERNAL_SERVICE_TOKEN', 'internal-service-token')
-
-# AuthServiceClient класс для совместимости
-class AuthServiceClient:
-    """Клиент для взаимодействия с сервисом авторизации."""
-
-    @staticmethod
-    def call_auth_service(endpoint: str, method: str = 'GET', data: Dict[str, Any] = None,
-                         headers: Dict[str, str] = None) -> Dict[str, Any]:
-        """
-        Вызвать метод сервиса авторизации.
-
-        Args:
-            endpoint: API endpoint (например, /api/tokens/cloud/yandex)
-            method: HTTP метод
-            data: Данные для POST/PUT запросов
-            headers: Дополнительные заголовки
-
-        Returns:
-            Ответ от сервиса авторизации
-        """
-        url = urljoin(AUTH_SERVICE_BASE, endpoint)
-        parsed = http.client.urlsplit(url)
-
-        conn_class = http.client.HTTPSConnection if parsed.scheme == 'https' else http.client.HTTPConnection
-        conn = conn_class(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80), timeout=10)
-
-        try:
-            req_headers = {"Authorization": f"Bearer {INTERNAL_TOKEN}"}
-            if headers:
-                req_headers.update(headers)
-
-            if data:
-                req_headers["Content-Type"] = "application/json"
-                body = json.dumps(data).encode('utf-8')
-            else:
-                body = None
-
-            conn.request(method.upper(), parsed.path, body=body, headers=req_headers)
-            resp = conn.getresponse()
-            response_data = resp.read()
-            text = response_data.decode('utf-8') if response_data else ''
-
-            if not (200 <= resp.status < 300):
-                raise HTTPException(
-                    status_code=resp.status,
-                    detail=f'Auth service error: {resp.status} {text}'
-                )
-
-            return json.loads(text) if text else {}
-
-        finally:
-            try:
-                conn.close()
-            except:
-                pass
-
-
-
-
-class YandexAuthManager:
-    """Менеджер авторизации Яндекса."""
-
-    @staticmethod
-    def get_yandex_oauth_url(state: str = None) -> str:
-        """
-        Получить URL для OAuth авторизации с Яндексом.
-
-        Args:
-            state: Состояние для защиты от CSRF
-
-        Returns:
-            URL для перенаправления пользователя
-        """
-        client_id = os.getenv('YANDEX_CLIENT_ID')
-        redirect_uri = os.getenv('YANDEX_REDIRECT_URI')
-        scope = os.getenv('YANDEX_OAUTH_SCOPE', 'smart_home')
-
-        if not client_id or not redirect_uri:
-            raise HTTPException(
-                status_code=500,
-                detail='YANDEX_CLIENT_ID and YANDEX_REDIRECT_URI must be set'
-            )
-
-        params = {
-            'response_type': 'code',
-            'client_id': client_id,
-            'redirect_uri': redirect_uri,
-            'scope': scope,
-        }
-        if state:
-            params['state'] = state
-
-        authorize_url = os.getenv('YANDEX_OAUTH_AUTHORIZE', 'https://oauth.yandex.ru/authorize')
-        return authorize_url + '?' + urlencode(params)
-
-    @staticmethod
-    async def exchange_code_for_token(code: str) -> Dict[str, Any]:
-        """
-        Обменять код авторизации на токен.
-
-        Args:
-            code: Код авторизации от Яндекса
-
-        Returns:
-            Информация о токене
-        """
-        client_id = os.getenv('YANDEX_CLIENT_ID')
-        client_secret = os.getenv('YANDEX_CLIENT_SECRET')
-        redirect_uri = os.getenv('YANDEX_REDIRECT_URI')
-
-        if not all([client_id, client_secret, redirect_uri]):
-            raise HTTPException(
-                status_code=500,
-                detail='YANDEX_CLIENT_ID, SECRET and REDIRECT_URI must be set'
-            )
-
-        # Обмен кода на токен
-        token_url = os.getenv('YANDEX_OAUTH_TOKEN', 'https://oauth.yandex.ru/token')
-        body = {
-            'grant_type': 'authorization_code',
-            'code': code,
-            'client_id': client_id,
-            'client_secret': client_secret,
-            'redirect_uri': redirect_uri
-        }
-
-        parsed = http.client.urlsplit(token_url)
-        conn_class = http.client.HTTPSConnection if parsed.scheme == 'https' else http.client.HTTPConnection
-        conn = conn_class(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80), timeout=10)
-
-        try:
-            headers = {"Content-Type": "application/x-www-form-urlencoded"}
-            conn.request('POST', parsed.path, body=urlencode(body), headers=headers)
-            resp = conn.getresponse()
-            response_data = resp.read()
-            text = response_data.decode('utf-8') if response_data else ''
-
-            if not (200 <= resp.status < 300):
-                raise HTTPException(
-                    status_code=502,
-                    detail=f'Failed exchanging token: {resp.status} {text}'
-                )
-
-            token_resp = json.loads(text)
-            return token_resp
-
-        finally:
-            try:
-                conn.close()
-            except:
-                pass
-
-    @staticmethod
-    async def save_yandex_tokens(access_token: str, refresh_token: str = None) -> bool:
-        """
-        Сохранить токены Яндекса в систему авторизации.
-
-        Args:
-            access_token: Access token от Яндекса
-            refresh_token: Refresh token от Яндекса (опционально)
-
-        Returns:
-            Успешность сохранения
-        """
-        try:
-            # Используем новый модуль аутентификации
-            from ...utils.auth_client import store_yandex_token
-            return store_yandex_token(access_token, refresh_token)
-        except ImportError:
-            # Резервный вариант через старый способ
-            try:
-                data = {
-                    "service": 'yandex_smart_home',
-                    "token": access_token,
-                    "refresh_token": refresh_token
-                }
-
-                # Используем AuthServiceClient из старого кода
-                url = urljoin(AUTH_SERVICE_BASE, '/api/tokens/cloud/yandex_smart_home')
-                parsed = http.client.urlsplit(url)
-
-                conn_class = http.client.HTTPSConnection if parsed.scheme == 'https' else http.client.HTTPConnection
-                conn = conn_class(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80), timeout=10)
-
-                try:
-                    headers = {"Authorization": f"Bearer {INTERNAL_TOKEN}", "Content-Type": "application/json"}
-                    body = json.dumps(data).encode('utf-8')
-
-                    conn.request('POST', parsed.path, body=body, headers=headers)
-                    resp = conn.getresponse()
-                    response_data = resp.read()
-                    text = response_data.decode('utf-8') if response_data else ''
-
-                    if not (200 <= resp.status < 300):
-                        raise Exception(f'Auth service returned {resp.status}: {text}')
-
-                    return True
-
-                finally:
-                    try:
-                        conn.close()
-                    except:
-                        pass
-            except Exception as e:
-                logger.error(f"Failed to save Yandex tokens: {e}")
-                return False
-
-    @staticmethod
-    async def get_yandex_token() -> Optional[str]:
-        """
-        Получить токен Яндекса из системы авторизации.
-
-        Returns:
-            Токен Яндекса или None если не настроен
-        """
-        try:
-            # Используем новый модуль аутентификации
-            from ...utils.auth_client import get_yandex_token as get_token
-            return get_token()
-        except ImportError:
-            # Резервный вариант через старый способ
-            try:
-                # Вызов через HTTP к сервису авторизации
-                url = urljoin(AUTH_SERVICE_BASE, '/api/tokens/cloud')
-                parsed = http.client.urlsplit(url)
-
-                conn_class = http.client.HTTPSConnection if parsed.scheme == 'https' else http.client.HTTPConnection
-                conn = conn_class(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80), timeout=10)
-
-                try:
-                    headers = {"Authorization": f"Bearer {INTERNAL_TOKEN}"}
-                    conn.request('GET', parsed.path, headers=headers)
-                    resp = conn.getresponse()
-                    response_data = resp.read()
-                    text = response_data.decode('utf-8') if response_data else ''
-
-                    if resp.status != 200:
-                        raise Exception(f'Failed to fetch tokens: {resp.status} {text}')
-
-                    tokens = json.loads(text) if text else {}
-                    ytoken = tokens.get('yandex_smart_home')
-
-                    if not ytoken:
-                        return None
-
-                    # Токен может быть строкой или объектом
-                    return ytoken if isinstance(ytoken, str) else ytoken.get('token')
-
-                finally:
-                    try:
-                        conn.close()
-                    except:
-                        pass
-            except Exception as e:
-                logger.error(f"Failed to get Yandex token: {e}")
-                return None
-
 
 class YandexSmartHomePlugin(InternalPluginBase):
-    """Плагин интеграции с Яндекс Умный Дом с интеграцией авторизации."""
+    """Yandex Smart Home plugin with OAuth and device synchronization."""
 
     id = "yandex_smart_home"
     name = "Yandex Smart Home"
-    version = "0.3.0"
+    version = "0.4.0"
     description = "Yandex Smart Home adapter - OAuth + device sync + intent mapping + auth integration"
 
     async def on_load(self):
-        """Инициализация плагина."""
-        from fastapi import APIRouter
+        """Initialize plugin."""
         self.router = APIRouter()
+        
+        # Ensure config exists
+        if not hasattr(self, "config") or self.config is None:
+            self.config = {}
+        
+        self.logger.info(f"🔧 YandexSmartHome plugin config on load: {self.config}")
 
-        # Регистрируем endpoints
-        self.router.add_api_route("/start_oauth", self.start_oauth, methods=["GET"])
-        self.router.add_api_route("/callback", self.oauth_callback, methods=["GET", "POST"])
-        self.router.add_api_route("/devices", self.list_devices_proxy, methods=["GET"])
-        self.router.add_api_route("/action", self.execute_action, methods=["POST"])
+        # Get get_current_user function from app.state for authentication
+        self.get_current_user_fn = getattr(self.app.state, 'get_current_user', None)
+        if not self.get_current_user_fn:
+            self.logger.warning("get_current_user not available in app.state - user authentication may not work")
 
-        # Добавляем эндпоинты для синхронизации устройств
-        self.router.add_api_route("/sync", self.sync_devices, methods=["POST"])
-        self.router.add_api_route("/sync_states", self.sync_device_states, methods=["POST"])
-        self.router.add_api_route("/discover", self.auto_discover_new_devices, methods=["POST"])
+        # Models are injected via SDK (self.models) - no need for separate core_models
 
-        # Добавляем эндпоинты для интентов и голосовых команд от Алисы
-        self.router.add_api_route("/alice", self.handle_alice_request, methods=["POST"])
-        self.router.add_api_route("/intents", self.list_intents, methods=["GET"])
-        self.router.add_api_route("/intents", self.create_intent, methods=["POST"])
-        self.router.add_api_route("/intents/{intent_name}", self.update_intent, methods=["PUT"])
-        self.router.add_api_route("/intents/{intent_name}", self.delete_intent, methods=["DELETE"])
-
-        self.logger.info("✅ Yandex Smart Home plugin with auth integration loaded")
-
-    async def start_oauth(self):
-        """Начать OAuth процесс с Яндексом."""
+        # Create plugin tables (use engine from db_session_maker)
         try:
-            url = YandexAuthManager.get_yandex_oauth_url()
-            return JSONResponse({"auth_url": url})
+            from .models import Base as yandex_base
+            # Get engine from session maker
+            engine = self.db_session_maker.kw.get('bind')
+            if engine:
+                async with engine.begin() as conn:
+                    await conn.run_sync(yandex_base.metadata.create_all)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            self.logger.warning(f"Could not create tables for Yandex Smart Home: {e}")
 
-    async def oauth_callback(self, request: Request):
-        """Обратный вызов OAuth от Яндекса."""
-        params = dict(request.query_params)
-        code = params.get('code') or (await request.form()).get('code') if request.method == 'POST' else None
-        if not code:
-            raise HTTPException(status_code=400, detail='code required')
+        # Initialize managers with db_session_maker
+        self.api_client = YandexAPIClient(self.config)
+        # Pass Device model to state manager via DI
+        device_model = self.models.get('Device')
+        # Получаем online_timeout из конфигурации плагина (глобальная настройка из ядра)
+        online_timeout = self.config.get('device_online_timeout', 300)  # По умолчанию 5 минут
+        self.state_manager = DeviceStateManager(
+            self.db_session_maker, 
+            parse_last_updated, 
+            self.logger, 
+            device_model,
+            online_timeout=online_timeout
+        )
+        self.device_manager = DeviceManager(self.db_session_maker, self.api_client, self.state_manager, self.config, models=self.models)
+        # Pass plugin instance (which now has core_models and db_session_maker)
+        self.route_handlers = RouteHandlers(self)
+        self.auth_handlers = AuthHandler(self)
+        self.device_handlers = DeviceHandlers(self)
+        self.alice_handlers = AliceHandlers(self)
+        self.intent_handlers = IntentHandlers(self)
 
-        # Обменять код на токен
-        token_resp = await YandexAuthManager.exchange_code_for_token(code)
-        access_token = token_resp.get('access_token') or token_resp.get('token')
+        # Register routes
+        self.router.add_api_route("/auth/start", self.auth_handlers.start_oauth, methods=["GET"])
+        self.router.add_api_route("/callback", self.auth_handlers.oauth_callback, methods=["GET", "POST"])
+        self.router.add_api_route("/auth/status", self.auth_handlers.auth_status, methods=["GET"])
+        self.router.add_api_route("/auth/unlink", self.auth_handlers.auth_unlink, methods=["POST"])
+        self.router.add_api_route("/devices", self.route_handlers.list_devices_proxy, methods=["GET"])
+        self.router.add_api_route("/action", self.route_handlers.execute_action, methods=["POST"])
+
+        # Device sync routes
+        self.router.add_api_route("/sync", self.device_handlers.sync_devices, methods=["POST"])
+        self.router.add_api_route("/sync_states", self.device_handlers.sync_device_states, methods=["POST"])
+        self.router.add_api_route("/discover", self.device_handlers.auto_discover_new_devices, methods=["POST"])
+        self.router.add_api_route("/bindings", self.device_handlers.list_bindings, methods=["GET"])
+        self.router.add_api_route("/bindings", self.device_handlers.create_binding, methods=["POST"])
+
+        # Alice and intent routes
+        self.router.add_api_route("/alice", self.alice_handlers.handle_alice_request, methods=["POST"])
+        self.router.add_api_route("/intents", self.intent_handlers.list_intents, methods=["GET"])
+        self.router.add_api_route("/intents", self.intent_handlers.create_intent, methods=["POST"])
+        self.router.add_api_route("/intents/{intent_name}", self.intent_handlers.update_intent, methods=["PUT"])
+        self.router.add_api_route("/intents/{intent_name}", self.intent_handlers.delete_intent, methods=["DELETE"])
         
-        if not access_token:
-            raise HTTPException(status_code=502, detail='No access_token in token response')
-
-        # Сохранить токены в систему авторизации
-        refresh_token = token_resp.get('refresh_token')
-        success = await YandexAuthManager.save_yandex_tokens(access_token, refresh_token)
-        
-        if not success:
-            raise HTTPException(status_code=500, detail='Failed to save tokens to auth service')
-
-        return JSONResponse({"status": "ok", "saved": True})
-
-    async def list_devices_proxy(self):
-        """Прокси для получения устройств из Яндекса."""
-        # Получить токен из системы авторизации
-        access_token = await YandexAuthManager.get_yandex_token()
-        if not access_token:
-            raise HTTPException(status_code=400, detail='Yandex token not configured')
-
-        # Вызвать Яндекс API
-        api_base = os.getenv('YANDEX_API_BASE', 'https://api.iot.yandex.net')
-        devices_path = os.getenv('YANDEX_DEVICES_PATH', '/v1.0/user/devices')
-        parsed_api = http.client.urlsplit(api_base)
-        conn_class = http.client.HTTPSConnection if parsed_api.scheme == 'https' else http.client.HTTPConnection
-        conn = conn_class(parsed_api.hostname, parsed_api.port or (443 if parsed_api.scheme == 'https' else 80), timeout=10)
-        
+        # ========== SUBSCRIBE TO DEVICE EVENTS ==========
+        # Подписываемся на события устройств для обработки команд
         try:
-            headers = {"Authorization": f"Bearer {access_token}"}
-            conn.request('GET', devices_path, headers=headers)
-            resp = conn.getresponse()
-            data = resp.read()
-            text = data.decode('utf-8') if data else ''
-            
-            if resp.status != 200:
-                raise HTTPException(status_code=502, detail=f'Yandex API error: {resp.status} {text}')
-            
-            devices = json.loads(text) if text else []
-            # Нормализовать устройства
-            normalized = []
-            if isinstance(devices, dict) and devices.get('devices'):
-                for d in devices.get('devices'):
-                    normalized.append({ 
-                        'id': d.get('id') or d.get('device_id') or d.get('instance_id'), 
-                        'name': d.get('name') or d.get('id'), 
-                        'type': d.get('type') or d.get('device_type') 
-                    })
-            elif isinstance(devices, list):
-                for d in devices:
-                    if isinstance(d, dict):
-                        normalized.append({ 
-                            'id': d.get('id') or d.get('device_id'), 
-                            'name': d.get('name'), 
-                            'type': d.get('type') 
-                        })
+            await self.events.subscribe("device.*.turn_on", self._handle_device_execute_event)
+            await self.events.subscribe("device.*.turn_off", self._handle_device_execute_event)
+            await self.events.subscribe("device.*.toggle", self._handle_device_execute_event)
+            await self.events.subscribe("device.*.execute", self._handle_device_execute_event)
+            self.logger.info("✅ Subscribed to device execute events")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to subscribe to events: {e}", exc_info=True)
+        
+        # ========== PERIODIC SYNC TASK ==========
+        # Запускаем периодическую синхронизацию устройств
+        # Используем device_poll_interval из глобальной конфигурации, если не задан sync_interval
+        sync_interval = self.config.get('sync_interval') or self.config.get('device_poll_interval', 300)
+        if sync_interval and sync_interval > 0:
+            # Проверяем, не добавлена ли уже задача (защита от дублирования)
+            existing_task = self.tasks.get_task("periodic_sync")
+            if not existing_task:
+                self.logger.info(f"🔄 Starting periodic device sync (interval: {sync_interval}s, from config: device_poll_interval={self.config.get('device_poll_interval', 'not set')})")
+                self.tasks.add_task(
+                    "periodic_sync",
+                    self._periodic_sync_all_users,
+                    interval=float(sync_interval)
+                )
             else:
-                normalized = devices
-                
-            return JSONResponse({ 'devices': normalized })
-            
-        finally:
-            try:
-                conn.close()
-            except:
-                pass
+                self.logger.debug("Periodic sync task already exists, skipping")
+        else:
+            self.logger.info("⏸️ Periodic sync disabled (sync_interval <= 0 or not set)")
+    
+    def get_core_model(self, model_name: str):
+        """Get core model class by name (DI helper)."""
+        return self.models.get(model_name)
+    
+    def get_session(self):
+        """Get database session context manager."""
+        return self.db_session_maker()
+    
+    def get_yandex_device_id(self, device: Any) -> Optional[str]:
+        """
+        Helper: получить Yandex device ID из Device или PluginBinding.
+        Используется для удобного доступа к данным Яндекса из ядра.
+        """
+        if hasattr(device, 'meta') and device.meta:
+            return device.meta.get('yandex_device_id')
+        return None
+    
+    def get_yandex_device_data(self, device: Any) -> Optional[Dict[str, Any]]:
+        """
+        Helper: получить полные данные устройства Яндекса из Device.meta.
+        Используется для удобного доступа к данным Яндекса из ядра.
+        """
+        if hasattr(device, 'meta') and device.meta:
+            return device.meta.get('yandex_device')
+        return None
+    
+    def is_yandex_device(self, device: Any) -> bool:
+        """
+        Helper: проверить, является ли устройство устройством Яндекса.
+        """
+        if hasattr(device, 'meta') and device.meta:
+            return device.meta.get('external_source') == 'yandex'
+        return False
 
-    async def execute_action(self, payload: dict):
-        """Выполнить действие на устройстве Яндекса."""
-        # Получить токен из системы авторизации
-        access_token = await YandexAuthManager.get_yandex_token()
-        if not access_token:
-            raise HTTPException(status_code=400, detail='Yandex token not configured')
-
-        device_id = payload.get('device_id')
-        if not device_id:
-            raise HTTPException(status_code=400, detail='device_id required')
-
-        api_base = os.getenv('YANDEX_API_BASE', 'https://api.iot.yandex.net')
-        action_path_template = os.getenv('YANDEX_ACTION_PATH', '/v1.0/devices/{device_id}/actions')
-        target_path = action_path_template.replace('{device_id}', str(device_id))
-        parsed_api = http.client.urlsplit(api_base)
-        conn_class = http.client.HTTPSConnection if parsed_api.scheme == 'https' else http.client.HTTPConnection
-        conn = conn_class(parsed_api.hostname, parsed_api.port or (443 if parsed_api.scheme == 'https' else 80), timeout=10)
+    async def _get_current_user_id(self, request: Request) -> str:
+        """
+        Extract user_id from request state or raise 401.
+        Без зависимостей от ядра - использует только DI и request.state.
+        """
+        # Option 1: User already set by middleware/dependency
+        if hasattr(request.state, 'user') and request.state.user:
+            user = request.state.user
+            # Handle both User object and dict payload
+            if hasattr(user, 'id'):
+                return str(user.id)
+            elif isinstance(user, dict):
+                user_id = user.get('sub') or user.get('id')
+                if user_id:
+                    return str(user_id)
+            else:
+                return str(user)
         
-        try:
-            headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-            body = json.dumps(payload.get('params') or payload)
-            conn.request('POST', target_path, body=body.encode('utf-8'), headers=headers)
-            resp = conn.getresponse()
-            data = resp.read()
-            text = data.decode('utf-8') if data else ''
-            
-            if not (200 <= resp.status < 300):
-                raise HTTPException(status_code=502, detail=f'Yandex action error: {resp.status} {text}')
-            
-            return JSONResponse({ 'status': 'ok', 'yandex_response': json.loads(text) if text else {} })
-            
-        finally:
+        # Option 2: Try to use get_current_user_fn if available (DI from core)
+        # This function is injected by plugin_loader and handles both Bearer token and cookies
+        if hasattr(self, 'get_current_user_fn') and self.get_current_user_fn:
             try:
-                conn.close()
-            except:
-                pass
+                # get_current_user_fn expects request and optional credentials
+                # We need to call it without Depends, so we create a mock credentials object
+                from fastapi.security import HTTPAuthorizationCredentials
+                
+                # Try with Bearer token first
+                auth_header = request.headers.get("Authorization")
+                if auth_header and auth_header.startswith("Bearer "):
+                    token = auth_header.split(" ")[1]
+                    # Create mock credentials object
+                    class MockCredentials:
+                        def __init__(self, token):
+                            self.credentials = token
+                    
+                    try:
+                        # Try to call with credentials
+                        user = await self.get_current_user_fn(request, MockCredentials(token))
+                        if user:
+                            return str(user.id if hasattr(user, 'id') else user)
+                    except Exception:
+                        # If that fails, try without credentials (it will check cookies)
+                        pass
+                
+                # Fallback: try without credentials (will check cookies)
+                try:
+                    user = await self.get_current_user_fn(request)
+                    if user:
+                        return str(user.id if hasattr(user, 'id') else user)
+                except Exception as e:
+                    self.logger.debug(f"get_current_user_fn failed: {e}")
+            except Exception as e:
+                self.logger.debug(f"Failed to use get_current_user_fn: {e}")
+        
+        # Option 3: Try to extract user_id from token payload directly (if middleware set it)
+        # This is a fallback - middleware should set request.state.user, but sometimes
+        # it might set just the payload in a different format
+        try:
+            # Check if there's a token payload in request state (set by middleware)
+            if hasattr(request.state, 'token_payload'):
+                payload = request.state.token_payload
+                if isinstance(payload, dict):
+                    user_id = payload.get('sub') or payload.get('id')
+                    if user_id:
+                        return str(user_id)
+        except Exception:
+            pass
+        
+        # No user found - raise 401
+        raise HTTPException(status_code=401, detail="Unauthorized: user authentication required")
+        
 
-    # Остальные методы остаются теми же, что и раньше...
-    # (sync_devices, sync_device_states, auto_discover_new_devices, и т.д.)
+    # ========== Device sync methods (delegates to handlers) ==========
     
     async def sync_devices(self, payload: Dict[str, Any] = None):
-        """Синхронизировать устройства между Яндекс и внутренней системой."""
-        try:
-            # Получаем устройства из Яндекса
-            yandex_response = await self.list_devices_proxy()
-            yandex_devices = yandex_response.get('content', {}).get('devices', [])
-            
-            # Получаем существующие связи
-            async with self.db_session_maker() as db:
-                # Получаем все существующие связи для Яндекса
-                existing_bindings_result = await db.execute(
-                    select(PluginBinding).where(
-                        PluginBinding.plugin_name == 'yandex_smart_home'
-                    )
-                )
-                existing_bindings = existing_bindings_result.scalars().all()
-                
-                # Создаем маппинг существующих связей
-                existing_yandex_ids = {binding.selector for binding in existing_bindings}
-                
-                # Синхронизируем устройства
-                synced_count = 0
-                for yandex_dev in yandex_devices:
-                    yandex_dev_id = yandex_dev.get('id')
-                    yandex_dev_name = yandex_dev.get('name', f"Yandex Device {yandex_dev_id}")
-                    yandex_dev_type = yandex_dev.get('type', 'unknown')
-                    
-                    if yandex_dev_id not in existing_yandex_ids:
-                        # Создаем новое внутреннее устройство
-                        device = Device(
-                            name=yandex_dev_name,
-                            type=yandex_dev_type,
-                            external_id=yandex_dev_id,
-                            external_source='yandex',
-                            config={'yandex_device': yandex_dev}
-                        )
-                        db.add(device)
-                        await db.flush()  # Получаем ID нового устройства
-                        
-                        # Создаем связь между Яндекс-устройством и внутренним устройством
-                        binding = PluginBinding(
-                            device_id=device.id,
-                            plugin_name='yandex_smart_home',
-                            selector=yandex_dev_id,
-                            enabled=True,
-                            config={'yandex_device': yandex_dev}
-                        )
-                        db.add(binding)
-                        synced_count += 1
-                    else:
-                        # Обновляем существующую связь если нужно
-                        for binding in existing_bindings:
-                            if binding.selector == yandex_dev_id:
-                                # Обновляем конфигурацию
-                                binding.config['yandex_device'] = yandex_dev
-                                binding.config['last_sync'] = json.dumps({'timestamp': asyncio.get_event_loop().time()})
-                                break
-                
-                await db.commit()
-                
-            self.logger.info(f"Synced {synced_count} new Yandex devices, total: {len(yandex_devices)}")
-            
-            return JSONResponse({
-                'status': 'ok',
-                'synced_new_devices': synced_count,
-                'total_yandex_devices': len(yandex_devices),
-                'message': f'Synced {synced_count} new Yandex devices, total {len(yandex_devices)} devices'
-            })
-        except Exception as e:
-            self.logger.error(f"Error syncing devices: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    async def sync_device_states(self):
-        """Синхронизировать состояния устройств из Яндекса."""
-        try:
-            # Получаем устройства из Яндекса (с их состояниями)
-            yandex_response = await self.list_devices_proxy()
-            yandex_devices = yandex_response.get('content', {}).get('devices', [])
-
-            async with self.db_session_maker() as db:
-                # Получаем все связи для Яндекса
-                bindings_result = await db.execute(
-                    select(PluginBinding).where(
-                        PluginBinding.plugin_name == 'yandex_smart_home'
-                    )
-                )
-                bindings = bindings_result.scalars().all()
-
-                updated_count = 0
-                for yandex_dev in yandex_devices:
-                    yandex_dev_id = yandex_dev.get('id')
-
-                    # Находим связанное внутреннее устройство
-                    for binding in bindings:
-                        if binding.selector == yandex_dev_id:
-                            # Обновляем состояние внутреннего устройства
-                            device_result = await db.execute(
-                                select(Device).where(Device.id == binding.device_id)
-                            )
-                            device = device_result.scalar_one_or_none()
-
-                            if device:
-                                # Обновляем состояние устройства
-                                device.config = device.config or {}
-                                device.config['yandex_state'] = yandex_dev.get('state', {})
-                                device.config['last_yandex_sync'] = json.dumps({'timestamp': asyncio.get_event_loop().time()})
-
-                                updated_count += 1
-                                break
-
-                await db.commit()
-
-            self.logger.info(f"Updated states for {updated_count} Yandex devices")
-
-            return JSONResponse({
-                'status': 'ok',
-                'updated_states': updated_count,
-                'message': f'Updated states for {updated_count} Yandex devices'
-            })
-        except Exception as e:
-            self.logger.error(f"Error syncing device states: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    async def auto_discover_new_devices(self):
-        """Автоматически обнаруживать новые устройства в Яндексе и создавать связи."""
-        try:
-            # Получаем текущие устройства из Яндекса
-            yandex_response = await self.list_devices_proxy()
-            yandex_devices = yandex_response.get('content', {}).get('devices', [])
-
-            discovered_count = 0
-            for yandex_dev in yandex_devices:
-                yandex_dev_id = yandex_dev.get('id')
-
-                # Проверяем, есть ли уже связь для этого устройства
-                async with self.db_session_maker() as db:
-                    binding_result = await db.execute(
-                        select(PluginBinding).where(
-                            PluginBinding.plugin_name == 'yandex_smart_home',
-                            PluginBinding.selector == yandex_dev_id
-                        )
-                    )
-                    existing_binding = binding_result.scalar_one_or_none()
-
-                    if not existing_binding:
-                        # Это новое устройство, создаем связь и внутреннее устройство
-                        device = Device(
-                            name=yandex_dev.get('name', f"Yandex Device {yandex_dev_id}"),
-                            type=yandex_dev.get('type', 'unknown'),
-                            external_id=yandex_dev_id,
-                            external_source='yandex',
-                            config={'yandex_device': yandex_dev, 'auto_created': True}
-                        )
-                        db.add(device)
-                        await db.flush()
-
-                        binding = PluginBinding(
-                            device_id=device.id,
-                            plugin_name='yandex_smart_home',
-                            selector=yandex_dev_id,
-                            enabled=True,
-                            config={'yandex_device': yandex_dev, 'auto_mapped': True}
-                        )
-                        db.add(binding)
-                        await db.commit()
-
-                        discovered_count += 1
-
-                        # Отправляем событие об обнаружении нового устройства
-                        await self.event_bus.emit('device.discovered', {
-                            'source': 'yandex',
-                            'device_id': device.id,
-                            'yandex_device_id': yandex_dev_id,
-                            'name': device.name,
-                            'type': device.type
-                        })
-
-            self.logger.info(f"Auto-discovered {discovered_count} new Yandex devices")
-
-            return JSONResponse({
-                'status': 'ok',
-                'discovered_devices': discovered_count,
-                'message': f'Auto-discovered {discovered_count} new Yandex devices'
-            })
-        except Exception as e:
-            self.logger.error(f"Error auto-discovering devices: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # Заглушки для методов, которые должны быть реализованы
-    async def list_bindings(self):
-        """Получить список связей между Яндекс-устройствами и внутренними устройствами."""
-        return JSONResponse({'bindings': []})
-
-    async def create_binding(self, payload: Dict[str, Any]):
-        """Создать связь между Яндекс-устройством и внутренним устройством."""
-        return JSONResponse({
-            'status': 'created',
-            'binding': payload
-        })
-
-    async def sync_device_states(self):
-        """Синхронизировать состояния устройств из Яндекса."""
-        try:
-            # Получаем устройства из Яндекса (с их состояниями)
-            yandex_response = await self.list_devices_proxy()
-            yandex_devices = yandex_response.get('content', {}).get('devices', [])
-
-            async with self.db_session_maker() as db:
-                # Получаем все связи для Яндекса
-                bindings_result = await db.execute(
-                    select(PluginBinding).where(
-                        PluginBinding.plugin_name == 'yandex_smart_home'
-                    )
-                )
-                bindings = bindings_result.scalars().all()
-
-                updated_count = 0
-                for yandex_dev in yandex_devices:
-                    yandex_dev_id = yandex_dev.get('id')
-
-                    # Находим связанное внутреннее устройство
-                    for binding in bindings:
-                        if binding.selector == yandex_dev_id:
-                            # Обновляем состояние внутреннего устройства
-                            device_result = await db.execute(
-                                select(Device).where(Device.id == binding.device_id)
-                            )
-                            device = device_result.scalar_one_or_none()
-
-                            if device:
-                                # Обновляем состояние устройства
-                                device.config = device.config or {}
-                                device.config['yandex_state'] = yandex_dev.get('state', {})
-                                device.config['last_yandex_sync'] = json.dumps({'timestamp': asyncio.get_event_loop().time()})
-
-                                updated_count += 1
-                                break
-
-                await db.commit()
-
-            self.logger.info(f"Updated states for {updated_count} Yandex devices")
-
-            return JSONResponse({
-                'status': 'ok',
-                'updated_states': updated_count,
-                'message': f'Updated states for {updated_count} Yandex devices'
-            })
-        except Exception as e:
-            self.logger.error(f"Error syncing device states: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # ========== Функции для интентов и голосовых команд от Алисы ==========
+        """
+        Public method для синхронизации устройств.
+        Вызывается из routes/devices.py
+        Делегирует выполнение в device_handlers.
+        """
+        user_id = payload.get('user_id') if payload else None
+        return await self.device_handlers.sync_devices(payload, user_id=user_id)
     
-    async def handle_alice_request(self, request: Request):
-        """Обработать запрос от Яндекс Алисы."""
-        try:
-            body = await request.json()
-            
-            # Проверяем тип запроса
-            request_type = body.get('request', {}).get('type', 'SimpleUtterance')
-            
-            if request_type == 'SimpleUtterance':
-                # Обработка голосовой команды
-                command = body.get('request', {}).get('command', '')
-                original_utterance = body.get('request', {}).get('original_utterance', command)
-                
-                # Обрабатываем команду
-                response_text = await self.process_alice_command(original_utterance)
-                
-                # Формируем ответ для Алисы
-                response = {
-                    "response": {
-                        "text": response_text,
-                        "tts": response_text,
-                        "end_session": False
-                    },
-                    "version": "1.0"
-                }
-                
-                return JSONResponse(response)
-            elif request_type == 'ButtonPressed':
-                # Обработка нажатия кнопки
-                payload = body.get('request', {}).get('payload', {})
-                return await self.handle_alice_button(payload)
-            else:
-                return JSONResponse({
-                    "response": {
-                        "text": "Извините, я не понимаю этот тип запроса",
-                        "end_session": False
-                    },
-                    "version": "1.0"
-                })
-        except Exception as e:
-            self.logger.error(f"Error handling Alice request: {e}")
-            return JSONResponse({
-                "response": {
-                    "text": "Произошла ошибка при обработке запроса",
-                    "end_session": False
-                },
-                "version": "1.0"
-            })
+    async def sync_device_states(self, payload: Dict[str, Any] = None):
+        """
+        Public method для синхронизации состояний устройств.
+        Делегирует выполнение в device_handlers.
+        """
+        user_id = payload.get('user_id') if payload else None
+        return await self.device_handlers.sync_device_states(user_id=user_id)
 
-    async def process_alice_command(self, command: str) -> str:
-        """Обработать голосовую команду от Алисы."""
+    async def _save_account(self, user_id: str, ya_user_id: Optional[str], access_token: str, refresh_token: Optional[str], expires_in: Optional[int]):
+        """
+        Helper to persist Yandex account info. Delegates to service.save_account.
+        """
         try:
-            # Пытаемся найти подходящий интент для команды
-            intent_name, params = await self.match_intent(command)
-            
-            if intent_name:
-                # Выполняем действие, связанное с интентом
-                result = await self.execute_intent_action(intent_name, params)
-                return result or f"Выполнил команду: {command}"
-            else:
-                # Пытаемся найти устройство по команде
-                device_action = await self.parse_device_command(command)
-                if device_action:
-                    # Выполняем действие на устройстве
-                    result = await self.execute_device_action(device_action['device_id'], device_action['action'], device_action.get('params', {}))
-                    return result or f"Выполнил действие на устройстве: {command}"
-                else:
-                    return f"Извините, я не понимаю команду: {command}"
+            await save_account(user_id=user_id, ya_user_id=ya_user_id, access_token=access_token, refresh_token=refresh_token, expires_in=expires_in)
+            self.logger.info(f"✅ Saved Yandex account for user {user_id}")
         except Exception as e:
-            self.logger.error(f"Error processing Alice command '{command}': {e}")
-            return "Произошла ошибка при обработке команды"
-
-    async def match_intent(self, command: str) -> tuple[Optional[str], Dict[str, Any]]:
-        """Найти подходящий интент для команды."""
+            self.logger.error(f"❌ Failed to save Yandex account for user {user_id}: {e}", exc_info=True)
+            raise
+    
+    async def _handle_device_execute_event(self, event_name: str, data: Dict[str, Any]):
+        """
+        Обработчик событий выполнения действий на устройствах.
+        Вызывается когда event_bus публикует событие device.{device_id}.execute
+        """
+        self.logger.info(f"📢 Event handler called: event={event_name}")
+        self.logger.info(f"   Data: {data}")
+        
         try:
-            async with self.db_session_maker() as db:
-                # Ищем интенты, которые могут соответствовать команде
-                intents_result = await db.execute(
-                    select(IntentMapping).where(
-                        IntentMapping.plugin_action.like(f'%{command}%')
-                    )
-                )
-                intents = intents_result.scalars().all()
-                
-                # Проверяем каждый интент на соответствие команде
-                for intent in intents:
-                    # Простое сопоставление - в реальности может быть сложнее (NLP)
-                    if intent.intent_name.lower() in command.lower() or \
-                       (intent.selector and intent.selector.lower() in command.lower()):
-                        return intent.intent_name, {'command': command}
-                
-                # Если не нашли подходящий интент, возвращаем None
-                return None, {}
-        except Exception as e:
-            self.logger.error(f"Error matching intent for command '{command}': {e}")
-            return None, {}
-
-    async def execute_intent_action(self, intent_name: str, params: Dict[str, Any]) -> Optional[str]:
-        """Выполнить действие, связанное с интентом."""
-        try:
-            async with self.db_session_maker() as db:
-                intent_result = await db.execute(
-                    select(IntentMapping).where(
-                        IntentMapping.intent_name == intent_name
-                    )
-                )
-                intent = intent_result.scalar_one_or_none()
-                
-                if not intent or not intent.plugin_action:
-                    return None
-                
-                # Выполняем действие через event bus
-                await self.event_bus.emit('intent.executed', {
-                    'intent_name': intent_name,
-                    'action': intent.plugin_action,
-                    'params': params,
-                    'source': 'alice'
-                })
-                
-                # Возвращаем результат выполнения
-                return f"Выполнил интент: {intent_name}"
-        except Exception as e:
-            self.logger.error(f"Error executing intent '{intent_name}': {e}")
-            return None
-
-    async def parse_device_command(self, command: str) -> Optional[Dict[str, Any]]:
-        """Разобрать команду устройства из голосовой команды."""
-        try:
-            # Простой парсер команд устройств - в реальности может быть сложнее
-            command_lower = command.lower()
+            device_id = data.get('device_id')
+            plugin = data.get('plugin')
+            payload = data.get('payload', {})
             
-            # Пытаемся определить действие
-            action = None
-            if 'включи' in command_lower or 'включить' in command_lower:
-                action = 'turn_on'
-            elif 'выключи' in command_lower or 'выключить' in command_lower:
-                action = 'turn_off'
-            elif 'открой' in command_lower or 'открыть' in command_lower:
-                action = 'open'
-            elif 'закрой' in command_lower or 'закрыть' in command_lower:
-                action = 'close'
-            elif 'увеличь' in command_lower or 'повысь' in command_lower:
-                action = 'increase'
-            elif 'уменьши' in command_lower or 'понизь' in command_lower:
-                action = 'decrease'
+            self.logger.info(f"   Device ID: {device_id}")
+            self.logger.info(f"   Plugin: {plugin}")
+            self.logger.info(f"   Payload: {payload}")
             
-            if not action:
-                return None
+            # Проверяем, что это событие для нашего плагина
+            if plugin != 'yandex_smart_home':
+                self.logger.debug(f"❌ Event not for yandex_smart_home plugin: {plugin}")
+                return
             
-            # Пытаемся определить устройство
-            async with self.db_session_maker() as db:
-                devices_result = await db.execute(select(Device))
-                devices = devices_result.scalars().all()
-                
-                for device in devices:
-                    device_name = device.name.lower()
-                    if device_name in command_lower:
-                        return {
-                            'device_id': device.id,
-                            'action': action,
-                            'params': {'command': command}
-                        }
-                
-                # Если не нашли конкретное устройство, можем вернуть общий запрос
-                return {
-                    'device_id': None,
-                    'action': action,
-                    'params': {'command': command, 'query': command_lower}
-                }
-                
-        except Exception as e:
-            self.logger.error(f"Error parsing device command '{command}': {e}")
-            return None
-
-    async def execute_device_action(self, device_id: Optional[str], action: str, params: Dict[str, Any]) -> Optional[str]:
-        """Выполнить действие на устройстве."""
-        try:
-            if not device_id:
-                # Если нет конкретного устройства, можем выполнить общий запрос
-                await self.event_bus.emit('device.action.requested', {
-                    'action': action,
-                    'params': params,
-                    'source': 'alice'
-                })
-                return f"Выполнил действие: {action}"
+            self.logger.info(f"✅ Event is for yandex_smart_home plugin")
             
-            # Найти связь между внутренним устройством и Яндекс-устройством
-            async with self.db_session_maker() as db:
+            # Получаем модели через DI
+            PluginBinding = self.models.get('PluginBinding')
+            if not PluginBinding:
+                self.logger.error("❌ PluginBinding model not available")
+                return
+            
+            # Получаем привязку устройства
+            async with self.get_session() as db:
                 binding_result = await db.execute(
                     select(PluginBinding).where(
                         PluginBinding.device_id == device_id,
-                        PluginBinding.plugin_name == 'yandex_smart_home'
+                        PluginBinding.plugin_name == 'yandex_smart_home',
+                        PluginBinding.enabled == True
                     )
                 )
                 binding = binding_result.scalar_one_or_none()
                 
-                if binding:
-                    # Выполнить команду через Яндекс API
-                    yandex_device_id = binding.selector
-                    yandex_response = await self.send_command_to_yandex_device(yandex_device_id, action, params)
-                    return yandex_response or f"Выполнил действие {action} на устройстве"
-                else:
-                    # Выполнить действие на внутреннем устройстве
-                    await self.event_bus.emit('device.action', {
-                        'device_id': device_id,
-                        'action': action,
-                        'params': params,
-                        'source': 'alice'
-                    })
-                    return f"Выполнил действие {action} на устройстве"
+                if not binding or not binding.selector:
+                    self.logger.warning(f"❌ No binding found for device {device_id}")
+                    return
+                
+                self.logger.info(f"✅ Found binding: selector={binding.selector}")
+                
+                # Получаем user_id из binding config или из payload
+                user_id = payload.get('user_id')
+                if not user_id and binding.config:
+                    user_id = binding.config.get('user_id')
+                
+                self.logger.info(f"👤 User ID: {user_id}")
+                
+                if not user_id:
+                    self.logger.warning(f"❌ No user_id found for device {device_id}")
+                    self.logger.warning(f"   Binding config: {binding.config}")
+                    self.logger.warning(f"   Payload: {payload}")
+                    return
+                
+                account_result = await db.execute(
+                    select(YandexUser).where(YandexUser.user_id == user_id)
+                )
+                account = account_result.scalar_one_or_none()
+                
+                if not account or not account.access_token:
+                    self.logger.warning(f"❌ No access token found for user {user_id}")
+                    return
+                
+                self.logger.info(f"✅ Got access token for user {user_id}")
+                
+                # Извлекаем action из event_name или payload
+                action = payload.get('action', 'execute')
+                if '.' in event_name:
+                    action = event_name.split('.')[-1]  # Последняя часть event_name (execute, turn_on, etc.)
+                
+                self.logger.info(f"🎯 Action: {action}")
+                
+                params = payload.get('params', payload)
+                self.logger.info(f"📦 Params: {params}")
+                
+                # Отправляем команду в Яндекс API через device_manager
+                yandex_device_id = binding.selector
+                
+                # Вызываем метод device_manager для выполнения действия
+                await self.device_manager.execute_device_action(
+                    yandex_device_id=yandex_device_id,
+                    action=action,
+                    params=params,
+                    access_token=account.access_token,
+                    device_id=device_id
+                )
+                
+                self.logger.info(f"✅ Command completed successfully")
+                
         except Exception as e:
-            self.logger.error(f"Error executing device action '{action}' on device {device_id}: {e}")
-            return None
-
-    async def send_command_to_yandex_device(self, yandex_device_id: str, action: str, params: Dict[str, Any]) -> Optional[str]:
-        """Отправить команду в Яндекс Умный Дом."""
-        try:
-            # Подготовить команду для Яндекс API
-            yandex_payload = {
-                'device_id': yandex_device_id,
-                'action': action,
-                'params': params
-            }
-            
-            # Вызвать выполнение действия через Яндекс API
-            result = await self.execute_action(yandex_payload)
-            return result.get('status', 'ok') if isinstance(result, dict) else 'ok'
-        except Exception as e:
-            self.logger.error(f"Error sending command to Yandex device {yandex_device_id}: {e}")
-            return None
-
-    async def handle_alice_button(self, payload: Dict[str, Any]) -> JSONResponse:
-        """Обработать нажатие кнопки в Алисе."""
-        try:
-            # Обработка нажатия кнопки
-            button_text = payload.get('title', 'Неизвестная кнопка')
-            
-            # Можем обрабатывать специальные кнопки
-            if button_text == 'Список устройств':
-                devices_response = await self.list_devices_proxy()
-                devices = devices_response.get('content', {}).get('devices', [])
-                device_list = ', '.join([d.get('name', d.get('id', 'Unknown')) for d in devices])
-                response_text = f"Устройства: {device_list}" if device_list else "Нет доступных устройств"
-            else:
-                response_text = f"Нажата кнопка: {button_text}"
-            
-            return JSONResponse({
-                "response": {
-                    "text": response_text,
-                    "tts": response_text,
-                    "end_session": False
-                },
-                "version": "1.0"
-            })
-        except Exception as e:
-            self.logger.error(f"Error handling Alice button: {e}")
-            return JSONResponse({
-                "response": {
-                    "text": "Произошла ошибка при обработке кнопки",
-                    "end_session": False
-                },
-                "version": "1.0"
-            })
-
-    # ========== Управление интентами ==========
+            self.logger.error(f"❌ Error handling device execute event: {e}", exc_info=True)
     
-    async def list_intents(self):
-        """Получить список интентов."""
+    async def _get_device_full_data(self, access_token: str, yandex_device_id: str) -> Dict[str, Any]:
+        """
+        Получить полные данные устройства из Яндекс Smart Home API (с last_updated).
+        Использует GET /v1.0/devices/{device_id}.
+        
+        Returns:
+            Dict с полными данными устройства включая capabilities с last_updated
+        """
+        self.logger.info(f"🔍 Getting full device data for: {yandex_device_id}")
+        
         try:
-            async with self.db_session_maker() as db:
-                intents_result = await db.execute(
-                    select(IntentMapping).where(
-                        IntentMapping.plugin_name == 'yandex_smart_home'
-                    )
-                )
-                intents = intents_result.scalars().all()
-                
-                intents_list = []
-                for intent in intents:
-                    intents_list.append({
-                        'id': intent.id,
-                        'intent_name': intent.intent_name,
-                        'selector': intent.selector,
-                        'plugin_action': intent.plugin_action,
-                        'description': intent.description,
-                        'enabled': intent.enabled
-                    })
-                
-                return JSONResponse({'intents': intents_list})
-        except Exception as e:
-            self.logger.error(f"Error listing intents: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    async def create_intent(self, payload: Dict[str, Any]):
-        """Создать новый интент."""
-        try:
-            intent_name = payload.get('intent_name')
-            selector = payload.get('selector')
-            plugin_action = payload.get('plugin_action')
-            description = payload.get('description', '')
-            enabled = payload.get('enabled', True)
+            api_base = cfg_get('YANDEX_API_BASE', self.config, default='https://api.iot.yandex.net')
+            device_path = f'/v1.0/devices/{yandex_device_id}'
             
-            if not intent_name or not plugin_action:
-                raise HTTPException(status_code=400, detail='intent_name and plugin_action are required')
+            parsed_api = http.client.urlsplit(api_base)
+            conn_class = http.client.HTTPSConnection if parsed_api.scheme == 'https' else http.client.HTTPConnection
+            conn = conn_class(parsed_api.hostname, parsed_api.port or (443 if parsed_api.scheme == 'https' else 80), timeout=10)
             
-            async with self.db_session_maker() as db:
-                intent = IntentMapping(
-                    intent_name=intent_name,
-                    selector=selector,
-                    plugin_name='yandex_smart_home',
-                    plugin_action=plugin_action,
-                    description=description,
-                    enabled=enabled
-                )
-                db.add(intent)
-                await db.commit()
+            try:
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json"
+                }
+                conn.request('GET', device_path, headers=headers)
+                resp = conn.getresponse()
+                data = resp.read()
+                text = data.decode('utf-8') if data else ''
                 
-                return JSONResponse({
-                    'status': 'created',
-                    'intent': {
-                        'id': intent.id,
-                        'intent_name': intent.intent_name,
-                        'selector': intent.selector,
-                        'plugin_action': intent.plugin_action,
-                        'description': intent.description,
-                        'enabled': intent.enabled
-                    }
-                })
+                if not (200 <= resp.status < 300):
+                    self.logger.warning(f'⚠️ Failed to get full device data: {resp.status}')
+                    return {}
+                
+                device_data = json.loads(text) if text else {}
+                self.logger.info(f"✅ Got full device data with last_updated timestamps")
+                return device_data
+                
+            finally:
+                try:
+                    conn.close()
+                except:
+                    pass
         except Exception as e:
-            self.logger.error(f"Error creating intent: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    async def update_intent(self, intent_name: str, payload: Dict[str, Any]):
-        """Обновить интент."""
+            self.logger.error(f"❌ Error getting full device data: {e}", exc_info=True)
+            return {}
+    
+    async def _periodic_sync_all_users(self):
+        """
+        Периодическая синхронизация устройств для всех пользователей с привязанными аккаунтами Яндекса.
+        Вызывается автоматически через TaskManager.
+        """
         try:
-            async with self.db_session_maker() as db:
-                intent_result = await db.execute(
-                    select(IntentMapping).where(
-                        IntentMapping.intent_name == intent_name,
-                        IntentMapping.plugin_name == 'yandex_smart_home'
-                    )
-                )
-                intent = intent_result.scalar_one_or_none()
-                
-                if not intent:
-                    raise HTTPException(status_code=404, detail=f'Intent {intent_name} not found')
-                
-                # Обновляем поля
-                if 'selector' in payload:
-                    intent.selector = payload['selector']
-                if 'plugin_action' in payload:
-                    intent.plugin_action = payload['plugin_action']
-                if 'description' in payload:
-                    intent.description = payload['description']
-                if 'enabled' in payload:
-                    intent.enabled = payload['enabled']
-                
-                await db.commit()
-                
-                return JSONResponse({
-                    'status': 'updated',
-                    'intent': {
-                        'id': intent.id,
-                        'intent_name': intent.intent_name,
-                        'selector': intent.selector,
-                        'plugin_action': intent.plugin_action,
-                        'description': intent.description,
-                        'enabled': intent.enabled
-                    }
-                })
+            from .models import YandexUser
+            from sqlalchemy import select
+            
+            # Уменьшаем логирование - только один раз при старте
+            if not hasattr(self, '_periodic_sync_started'):
+                self.logger.info("🔄 Starting periodic sync for all users")
+                self._periodic_sync_started = True
+            else:
+                self.logger.debug("🔄 Periodic sync running")
+            
+            # Получаем всех пользователей с привязанными аккаунтами Яндекса
+            async with self.get_session() as db:
+                users_result = await db.execute(select(YandexUser))
+                yandex_users = users_result.scalars().all()
+            
+            if not yandex_users:
+                self.logger.debug("No Yandex users found for periodic sync")
+                return
+            
+            synced_count = 0
+            error_count = 0
+            
+            for yandex_user in yandex_users:
+                try:
+                    user_id = yandex_user.user_id
+                    self.logger.debug(f"Syncing devices for user {user_id}")
+                    
+                    # Выполняем синхронизацию для пользователя
+                    await self.sync_devices({'user_id': user_id})
+                    await self.sync_device_states({'user_id': user_id})
+                    
+                    # Опционально: полная синхронизация (может быть медленной)
+                    if self.config.get('full_sync_on_periodic', False):
+                        if hasattr(self, 'device_manager') and self.device_manager:
+                            await self.device_manager.poll_authoritative_states(
+                                user_id=user_id,
+                                concurrency=5,  # Меньше параллелизма для фоновой задачи
+                                delay_between=0.05
+                            )
+                    
+                    synced_count += 1
+                    self.logger.debug(f"✅ Synced devices for user {user_id}")
+                    
+                except Exception as e:
+                    error_count += 1
+                    self.logger.warning(f"⚠️ Failed to sync devices for user {yandex_user.user_id}: {e}")
+            
+            self.logger.info(f"🔄 Periodic sync completed: {synced_count} users synced, {error_count} errors")
+            
         except Exception as e:
-            self.logger.error(f"Error updating intent {intent_name}: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    async def delete_intent(self, intent_name: str):
-        """Удалить интент."""
-        try:
-            async with self.db_session_maker() as db:
-                intent_result = await db.execute(
-                    select(IntentMapping).where(
-                        IntentMapping.intent_name == intent_name,
-                        IntentMapping.plugin_name == 'yandex_smart_home'
-                    )
-                )
-                intent = intent_result.scalar_one_or_none()
-                
-                if not intent:
-                    raise HTTPException(status_code=404, detail=f'Intent {intent_name} not found')
-                
-                await db.delete(intent)
-                await db.commit()
-                
-                return JSONResponse({'status': 'deleted', 'intent_name': intent_name})
-        except Exception as e:
-            self.logger.error(f"Error deleting intent {intent_name}: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
+            self.logger.error(f"❌ Error in periodic sync: {e}", exc_info=True)
+    
     async def on_unload(self):
         """Cleanup при выгрузке."""
+        # Останавливаем все фоновые задачи
+        if hasattr(self, 'tasks'):
+            self.tasks.stop_all()
         self.logger.info("👋 Yandex Smart Home plugin with auth integration unloaded")

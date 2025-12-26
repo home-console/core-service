@@ -23,6 +23,163 @@ except ImportError:
 router = APIRouter()
 
 
+@router.get("/admin/events/logs")
+async def get_event_logs(limit: int = 100, filter: str = None):
+    """
+    Получить логи событий из event_bus.
+    
+    Args:
+        limit: Максимальное количество записей (по умолчанию 100)
+        filter: Фильтр по имени события (поддерживает wildcards, например "device.*")
+    """
+    try:
+        from ..event_bus import event_bus
+        logs = event_bus.get_logs(limit=limit, event_filter=filter)
+        return JSONResponse({
+            "status": "ok",
+            "data": {
+                "logs": logs,
+                "count": len(logs)
+            }
+        })
+    except Exception as e:
+        return JSONResponse({
+            "status": "error",
+            "message": str(e)
+        }, status_code=500)
+
+
+@router.get("/admin/events/stats")
+async def get_event_stats():
+    """Получить статистику по событиям."""
+    try:
+        from ..event_bus import event_bus
+        stats = event_bus.get_stats()
+        return JSONResponse({
+            "status": "ok",
+            "data": stats
+        })
+    except Exception as e:
+        return JSONResponse({
+            "status": "error",
+            "message": str(e)
+        }, status_code=500)
+
+
+@router.post("/admin/events/clear")
+async def clear_event_logs():
+    """Очистить лог событий."""
+    try:
+        from ..event_bus import event_bus
+        event_bus.clear_log()
+        return JSONResponse({
+            "status": "ok",
+            "message": "Event log cleared"
+        })
+    except Exception as e:
+        return JSONResponse({
+            "status": "error",
+            "message": str(e)
+        }, status_code=500)
+
+
+@router.get("/admin/logs")
+async def get_application_logs(
+    limit: int = 100,
+    level: str = None,
+    module: str = None,
+    search: str = None,
+    logger_name: str = None
+):
+    """
+    Получить логи приложения (ядро, плагины и т.д.).
+    
+    Args:
+        limit: Максимальное количество записей (по умолчанию 100)
+        level: Фильтр по уровню (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        module: Фильтр по модулю (например, 'core_service', 'plugin')
+        search: Поиск по сообщению
+        logger_name: Фильтр по имени логгера
+    """
+    try:
+        from ..utils.log_collector import application_log_collector
+        
+        if application_log_collector is None:
+            return JSONResponse({
+                "status": "error",
+                "message": "Log collector not initialized"
+            }, status_code=503)
+        
+        logs = application_log_collector.get_logs(
+            limit=limit,
+            level=level,
+            module=module,
+            search=search,
+            logger_name=logger_name
+        )
+        
+        return JSONResponse({
+            "status": "ok",
+            "data": {
+                "logs": logs,
+                "count": len(logs)
+            }
+        })
+    except Exception as e:
+        return JSONResponse({
+            "status": "error",
+            "message": str(e)
+        }, status_code=500)
+
+
+@router.get("/admin/logs/stats")
+async def get_application_logs_stats():
+    """Получить статистику по логам приложения."""
+    try:
+        from ..utils.log_collector import application_log_collector
+        
+        if application_log_collector is None:
+            return JSONResponse({
+                "status": "error",
+                "message": "Log collector not initialized"
+            }, status_code=503)
+        
+        stats = application_log_collector.get_stats()
+        return JSONResponse({
+            "status": "ok",
+            "data": stats
+        })
+    except Exception as e:
+        return JSONResponse({
+            "status": "error",
+            "message": str(e)
+        }, status_code=500)
+
+
+@router.post("/admin/logs/clear")
+async def clear_application_logs():
+    """Очистить логи приложения."""
+    try:
+        from ..utils.log_collector import application_log_collector
+        
+        if application_log_collector is None:
+            return JSONResponse({
+                "status": "error",
+                "message": "Log collector not initialized"
+            }, status_code=503)
+        
+        application_log_collector.clear()
+        return JSONResponse({
+            "status": "ok",
+            "message": "Application logs cleared"
+        })
+    except Exception as e:
+        return JSONResponse({
+            "status": "error",
+            "message": str(e)
+        }, status_code=500)
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
     """Serve admin dashboard."""

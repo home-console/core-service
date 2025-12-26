@@ -1,0 +1,163 @@
+"""Intent handlers for Yandex Smart Home plugin."""
+import logging
+from typing import Dict, Any
+
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+from sqlalchemy import select
+
+
+logger = logging.getLogger(__name__)
+
+
+class IntentHandlers:
+    """Handlers for intent management operations."""
+
+    def __init__(self, plugin_instance):
+        """Initialize handlers with plugin instance reference."""
+        self.plugin = plugin_instance
+        self.db_session_maker = plugin_instance.db_session_maker if hasattr(plugin_instance, 'db_session_maker') else None
+        self.logger = logging.getLogger(__name__)
+
+    async def list_intents(self):
+        """Получить список интентов."""
+        # removed
+        # models: IntentMapping
+        
+        try:
+            async with self.plugin.get_session() as db:
+                intents_result = await db.execute(
+                    select(IntentMapping).where(
+                        IntentMapping.plugin_name == 'yandex_smart_home'
+                    )
+                )
+                intents = intents_result.scalars().all()
+
+                intents_list = []
+                for intent in intents:
+                    intents_list.append({
+                        'id': intent.id,
+                        'intent_name': intent.intent_name,
+                        'selector': intent.selector,
+                        'plugin_action': intent.plugin_action,
+                        'description': intent.description,
+                        'enabled': intent.enabled
+                    })
+
+                return JSONResponse({'intents': intents_list})
+        except Exception as e:
+            self.logger.error(f"Error listing intents: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def create_intent(self, payload: Dict[str, Any]):
+        """Создать новый интент."""
+        # removed
+        # models: IntentMapping
+        
+        try:
+            intent_name = payload.get('intent_name')
+            selector = payload.get('selector')
+            plugin_action = payload.get('plugin_action')
+            description = payload.get('description', '')
+            enabled = payload.get('enabled', True)
+
+            if not intent_name or not plugin_action:
+                raise HTTPException(status_code=400, detail='intent_name and plugin_action are required')
+
+            async with self.plugin.get_session() as db:
+                intent = IntentMapping(
+                    intent_name=intent_name,
+                    selector=selector,
+                    plugin_name='yandex_smart_home',
+                    plugin_action=plugin_action,
+                    description=description,
+                    enabled=enabled
+                )
+                db.add(intent)
+                await db.commit()
+
+                return JSONResponse({
+                    'status': 'created',
+                    'intent': {
+                        'id': intent.id,
+                        'intent_name': intent.intent_name,
+                        'selector': intent.selector,
+                        'plugin_action': intent.plugin_action,
+                        'description': intent.description,
+                        'enabled': intent.enabled
+                    }
+                })
+        except Exception as e:
+            self.logger.error(f"Error creating intent: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def update_intent(self, intent_name: str, payload: Dict[str, Any]):
+        """Обновить интент."""
+        # removed
+        # models: IntentMapping
+        
+        try:
+            async with self.plugin.get_session() as db:
+                intent_result = await db.execute(
+                    select(IntentMapping).where(
+                        IntentMapping.intent_name == intent_name,
+                        IntentMapping.plugin_name == 'yandex_smart_home'
+                    )
+                )
+                intent = intent_result.scalar_one_or_none()
+
+                if not intent:
+                    raise HTTPException(status_code=404, detail=f'Intent {intent_name} not found')
+
+                # Обновляем поля
+                if 'selector' in payload:
+                    intent.selector = payload['selector']
+                if 'plugin_action' in payload:
+                    intent.plugin_action = payload['plugin_action']
+                if 'description' in payload:
+                    intent.description = payload['description']
+                if 'enabled' in payload:
+                    intent.enabled = payload['enabled']
+
+                await db.commit()
+
+                return JSONResponse({
+                    'status': 'updated',
+                    'intent': {
+                        'id': intent.id,
+                        'intent_name': intent.intent_name,
+                        'selector': intent.selector,
+                        'plugin_action': intent.plugin_action,
+                        'description': intent.description,
+                        'enabled': intent.enabled
+                    }
+                })
+        except Exception as e:
+            self.logger.error(f"Error updating intent {intent_name}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def delete_intent(self, intent_name: str):
+        """Удалить интент."""
+        # removed
+        # models: IntentMapping
+        
+        try:
+            async with self.plugin.get_session() as db:
+                intent_result = await db.execute(
+                    select(IntentMapping).where(
+                        IntentMapping.intent_name == intent_name,
+                        IntentMapping.plugin_name == 'yandex_smart_home'
+                    )
+                )
+                intent = intent_result.scalar_one_or_none()
+
+                if not intent:
+                    raise HTTPException(status_code=404, detail=f'Intent {intent_name} not found')
+
+                await db.delete(intent)
+                await db.commit()
+
+                return JSONResponse({'status': 'deleted', 'intent_name': intent_name})
+        except Exception as e:
+            self.logger.error(f"Error deleting intent {intent_name}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))

@@ -21,7 +21,11 @@ class Device(Base):
     # `metadata` is reserved by SQLAlchemy Declarative API, use attribute name `meta`
     # but keep the DB column name as `metadata` for compatibility.
     meta = Column('metadata', JSON, nullable=True)
+    is_online = Column(Boolean, default=False, nullable=False)  # Устройство онлайн?
+    is_on = Column(Boolean, default=False, nullable=False)  # Устройство включено?
+    last_seen = Column(DateTime, nullable=True)  # Последнее время онлайна
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 class PluginBinding(Base):
@@ -29,6 +33,7 @@ class PluginBinding(Base):
     id = Column(String(128), primary_key=True)
     device_id = Column(String(128), index=True, nullable=False)
     plugin_name = Column(String(128), nullable=False)
+    selector = Column(String(255), nullable=True)  # Внешний идентификатор устройства (например, yandex_device_id)
     config = Column(JSON, nullable=True)
     enabled = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -41,6 +46,26 @@ class IntentMapping(Base):
     selector = Column(String(255), nullable=True)  # simple selector like alias=name
     plugin_action = Column(String(255), nullable=False)  # canonical action e.g. plugin.action
     payload_template = Column(Text, nullable=True)  # JSON template or jinja
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class DeviceLink(Base):
+    """
+    Связь между двумя устройствами в системе.
+    Позволяет связать устройство из одного источника (например, Яндекс) 
+    с устройством из другого источника (например, локальное устройство).
+    
+    Пример: Яндекс-лампа -> Локальное реле
+    При команде на Яндекс-устройство, команда перенаправляется на связанное устройство.
+    """
+    __tablename__ = "device_links"
+    id = Column(String(128), primary_key=True)
+    source_device_id = Column(String(128), index=True, nullable=False)  # Устройство-источник (например, из Яндекса)
+    target_device_id = Column(String(128), index=True, nullable=False)  # Устройство-цель (например, локальное)
+    link_type = Column(String(64), nullable=True)  # Тип связи: 'bridge', 'proxy', 'sync', 'mirror'
+    direction = Column(String(32), default='bidirectional', nullable=False)  # 'unidirectional' или 'bidirectional'
+    enabled = Column(Boolean, default=True, nullable=False)
+    config = Column(JSON, nullable=True)  # Дополнительная конфигурация связи
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 

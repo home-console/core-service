@@ -21,17 +21,18 @@ import tempfile
 import shutil
 import subprocess
 import asyncio
+import site
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from sqlalchemy import select
 from .plugin_base import InternalPluginBase
 try:
     from .event_bus import event_bus
-    from .models import Plugin, PluginVersion
+    from .models import Plugin, PluginVersion, Device, PluginBinding, IntentMapping
     from .db import get_session
 except ImportError:
     from core_service.event_bus import event_bus
-    from core_service.models import Plugin, PluginVersion
+    from core_service.models import Plugin, PluginVersion, Device, PluginBinding, IntentMapping
     from core_service.db import get_session
 
 logger = logging.getLogger(__name__)
@@ -164,6 +165,8 @@ class PluginLoader:
         
         # Filter out non-plugin modules (like __init__, base, loader, embed, models)
         excluded = {'__init__', 'base', 'loader', 'embed', 'models', 'utils'}
+        # Patterns to exclude: examples, tests, generated files, utility scripts
+        excluded_patterns = ['_example', 'example', '_test', 'test', 'generate_', 'setup', 'migration']
         loaded_count = 0
         for module_name, is_package in plugin_modules:
             module_basename = module_name.split('.')[-1]
@@ -171,8 +174,42 @@ class PluginLoader:
                 logger.debug(f"⏭️ Skipping excluded module: {module_name}")
                 continue
             
+            # Skip modules matching excluded patterns
+            if any(pattern in module_basename.lower() for pattern in excluded_patterns):
+                logger.debug(f"⏭️ Skipping module matching excluded pattern: {module_name}")
+                continue
+            
             # Для пакетов (подпапок) проверяем, есть ли в них класс плагина
             if is_package:
+                # Сначала проверяем и устанавливаем зависимости перед импортом
+                try:
+                    # Получаем путь к папке плагина используя уже известный plugins_package
+                    plugin_dir_name = module_name.split('.')[-1]
+                    
+                    if plugins_package and hasattr(plugins_package, '__path__'):
+                        # Используем путь из plugins_package
+                        base_path = plugins_package.__path__[0]
+                        plugin_path = os.path.join(base_path, plugin_dir_name)
+                        
+                        if os.path.isdir(plugin_path):
+                            # Проверяем requirements.txt и устанавливаем зависимости
+                            requirements_file = os.path.join(plugin_path, 'requirements.txt')
+                            if os.path.exists(requirements_file):
+                                logger.info(f"📦 Found requirements.txt for builtin plugin {plugin_dir_name}, installing dependencies...")
+                                deps_result = await asyncio.to_thread(
+                                    self._install_plugin_dependencies, 
+                                    plugin_path, 
+                                    plugin_dir_name
+                                )
+                                if deps_result.get('status') == 'installed':
+                                    logger.info(f"✅ Dependencies installed for plugin {plugin_dir_name}")
+                                elif deps_result.get('status') == 'failed':
+                                    logger.warning(f"⚠️ Failed to install dependencies for {plugin_dir_name}: {deps_result.get('error')}")
+                                    # Продолжаем загрузку даже если зависимости не установились
+                except Exception as e:
+                    logger.debug(f"Could not check/install dependencies for {module_name}: {e}")
+                    # Продолжаем загрузку даже если не удалось проверить зависимости
+                
                 # Пробуем загрузить модуль и найти класс плагина
                 try:
                     module = importlib.import_module(module_name)
@@ -402,8 +439,18 @@ class PluginLoader:
                 logger.warning(f"⚠️ No InternalPluginBase subclass found in {os.path.basename(file_path)}")
                 return
             
-            # Создаём экземпляр плагина
-            plugin = plugin_class(self.app, self.db_session_maker, self.event_bus)
+            # ========== DEPENDENCY INJECTION: MODELS ==========
+            # Подготавливаем модели для передачи в плагин (чтобы плагин не импортировал их напрямую)
+            models_dict = {
+                'Device': Device,
+                'PluginBinding': PluginBinding,
+                'IntentMapping': IntentMapping,
+                'Plugin': Plugin,
+                'PluginVersion': PluginVersion,
+            }
+            
+            # Создаём экземпляр плагина с передачей моделей
+            plugin = plugin_class(self.app, self.db_session_maker, self.event_bus, models=models_dict)
             
             # Проверяем, включен ли плагин в БД (для плагинов, которые уже были загружены ранее)
             if not await self._is_plugin_enabled(plugin.id):
@@ -426,69 +473,94 @@ class PluginLoader:
             # Вызываем on_load с обработкой ошибок
             try:
                 await plugin.on_load()
+                plugin._is_loaded = True
             except Exception as e:
                 logger.error(f"⚠️ Plugin on_load failed for {plugin.id}: {e}", exc_info=True)
-                # Продолжаем работу, роуты могут быть уже определены
+                # Не продолжаем если on_load failed
+                return
             
-            # Регистрируем router если он есть
+            # ========== SDK v0.0.2: AUTOMATIC ROUTER MOUNTING ==========
+            # Используем встроенный метод mount_router() из SDK вместо ручной регистрации
             if plugin.router:
-                # Инфраструктурные плагины (client_manager) монтируются без префикса плагина
-                if plugin.id == "client_manager":
-                    prefix = "/api"
-                    logger.debug(f"  📍 Registered infrastructure plugin router at {prefix}")
-                else:
-                    prefix = f"/api/v1/plugins/{plugin.id}"
-                    logger.debug(f"  📍 Registered plugin router at {prefix}")
-                
-                # Capture routes before mounting to identify exactly which route
-                # objects are added by include_router, then store those objects
-                # so we can remove only them on unload (safer than prefix matching).
-                before_app_routes = list(self.app.routes)
-                before_router_routes = None
-                if hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
-                    try:
-                        before_router_routes = list(self.app.router.routes)
-                    except Exception:
-                        before_router_routes = None
-
-                self.app.include_router(
-                    plugin.router,
-                    prefix=prefix,
-                    tags=[plugin.name]
-                )
-
-                # Determine newly added routes
-                added_routes = []
                 try:
-                    after_app_routes = list(self.app.routes)
-                    for r in after_app_routes:
-                        if r not in before_app_routes:
-                            added_routes.append(r)
-                except Exception:
-                    pass
-
-                try:
-                    if before_router_routes is not None and hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
-                        after_router_routes = list(self.app.router.routes)
-                        for r in after_router_routes:
-                            if r not in before_router_routes and r not in added_routes:
-                                added_routes.append(r)
-                except Exception:
-                    pass
-
-                # Save route objects for precise removal on unload
-                try:
-                    async with self._lock:
-                        self.plugin_routes[plugin.id] = added_routes
-                except Exception:
-                    self.plugin_routes[plugin.id] = added_routes
-
-                # Force regenerate OpenAPI schema so Swagger UI shows newly added routes
-                try:
-                    if hasattr(self.app, 'openapi_schema'):
-                        self.app.openapi_schema = None
-                except Exception:
-                    pass
+                    # Определяем prefix: инфраструктурные плагины (infrastructure=true в manifest) без префикса
+                    is_infrastructure = (
+                        metadata.get('infrastructure', False) or
+                        getattr(plugin, 'infrastructure', False) or
+                        metadata.get('type') == 'infrastructure'
+                    )
+                    
+                    if is_infrastructure:
+                        # Инфраструктурные плагины монтируются на /api без префикса плагина
+                        custom_prefix = "/api"
+                        logger.debug(f"  🏗️ Infrastructure plugin {plugin.id} mounted at {custom_prefix}")
+                    else:
+                        custom_prefix = f"/api/plugins/{plugin.id}"
+                    
+                    # Временно сохраняем prefix для mount_router
+                    original_mount = plugin.mount_router
+                    
+                    async def custom_mount():
+                        # Модифицируем mount_router для использования custom prefix
+                        if plugin.router and not plugin._router_mounted:
+                            before_app_routes = list(self.app.routes)
+                            before_router_routes = None
+                            if hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
+                                try:
+                                    before_router_routes = list(self.app.router.routes)
+                                except Exception:
+                                    pass
+                            
+                            # Монтируем router
+                            self.app.include_router(
+                                plugin.router,
+                                prefix=custom_prefix,
+                                tags=[plugin.name]
+                            )
+                            plugin._router_mounted = True
+                            logger.info(f"✅ Router mounted at {custom_prefix}")
+                            
+                            # Сохраняем добавленные routes для удаления
+                            added_routes = []
+                            try:
+                                after_app_routes = list(self.app.routes)
+                                for r in after_app_routes:
+                                    if r not in before_app_routes:
+                                        added_routes.append(r)
+                            except Exception:
+                                pass
+                            
+                            try:
+                                if before_router_routes is not None and hasattr(self.app, 'router'):
+                                    after_router_routes = list(self.app.router.routes)
+                                    for r in after_router_routes:
+                                        if r not in before_router_routes and r not in added_routes:
+                                            added_routes.append(r)
+                            except Exception:
+                                pass
+                            
+                            # Сохраняем route objects
+                            try:
+                                async with self._lock:
+                                    self.plugin_routes[plugin.id] = added_routes
+                            except Exception:
+                                self.plugin_routes[plugin.id] = added_routes
+                            
+                            # Force regenerate OpenAPI schema
+                            try:
+                                if hasattr(self.app, 'openapi_schema'):
+                                    self.app.openapi_schema = None
+                            except Exception:
+                                pass
+                    
+                    # Вызываем модифицированный mount
+                    await custom_mount()
+                    
+                except Exception as e:
+                    logger.error(f"❌ Failed to mount router for {plugin.id}: {e}", exc_info=True)
+                    # Не прерываем загрузку плагина
+            else:
+                logger.debug(f"  ℹ️ Plugin {plugin.id} has no router to mount")
             
             # Сохраняем в реестр
             try:
@@ -583,6 +655,45 @@ class PluginLoader:
                 
                 # Конфигурация плагина если есть
                 plugin_config = getattr(plugin, 'config', None)
+
+                # Преобразуем PluginConfig или другие нестандартные объекты в JSON-сериализуемую структуру
+                def _to_serializable(obj):
+                    if obj is None:
+                        return None
+                    # Простые типы оставляем как есть
+                    if isinstance(obj, (dict, list, str, int, float, bool)):
+                        return obj
+                    # Попробуем pydantic-like to_dict
+                    if hasattr(obj, 'dict') and callable(getattr(obj, 'dict')):
+                        try:
+                            return obj.dict()
+                        except Exception:
+                            pass
+                    # Если это обёртка PluginConfig — возьмём plugin_id и кеш
+                    if hasattr(obj, 'plugin_id'):
+                        result = {'plugin_id': getattr(obj, 'plugin_id')}
+                        if hasattr(obj, '_config_cache'):
+                            try:
+                                result['cache'] = dict(getattr(obj, '_config_cache') or {})
+                            except Exception:
+                                result['cache'] = str(getattr(obj, '_config_cache'))
+                        return result
+                    # Если есть __dict__, возьмём его (фильтруя приватные и несериализуемые значения)
+                    if hasattr(obj, '__dict__'):
+                        out = {}
+                        for k, v in vars(obj).items():
+                            if k.startswith('__'):
+                                continue
+                            try:
+                                json.dumps(v)
+                                out[k] = v
+                            except Exception:
+                                out[k] = str(v)
+                        return out
+                    # Фоллбек — str()
+                    return str(obj)
+
+                plugin_config_serializable = _to_serializable(plugin_config)
                 
                 # Создаем или обновляем запись Plugin
                 if not existing:
@@ -597,7 +708,7 @@ class PluginLoader:
                         runtime_mode=runtime_mode,
                         supported_modes=supported_modes,
                         mode_switch_supported=mode_switch_supported,
-                        config=plugin_config
+                        config=plugin_config_serializable
                     )
                     db.add(plugin_obj)
                     await db.flush()
@@ -620,7 +731,7 @@ class PluginLoader:
                         existing.supported_modes = supported_modes
                     existing.mode_switch_supported = mode_switch_supported
                     if plugin_config is not None:
-                        existing.config = plugin_config
+                        existing.config = plugin_config_serializable
                     await db.flush()
                     logger.debug(f"💾 Updated Plugin record in DB: {plugin.id} (mode: {runtime_mode}, supported: {supported_modes})")
                 
@@ -717,6 +828,7 @@ class PluginLoader:
             logger.debug(f"Loading {plugin_type} plugin from module: {module_name}")
             
             # Импортируем модуль
+            # Примечание: для встроенных плагинов зависимости проверяются в _load_builtin_plugins перед вызовом load_plugin
             module = importlib.import_module(module_name)
             
             # Ищем класс плагина (наследник InternalPluginBase)
@@ -748,13 +860,83 @@ class PluginLoader:
                 logger.warning(f"⚠️ No InternalPluginBase subclass found in {module_name}")
                 return
             
-            # Создаём экземпляр плагина
-            plugin = plugin_class(self.app, self.db_session_maker, self.event_bus)
+            # ========== DEPENDENCY INJECTION: MODELS ==========
+            # Подготавливаем модели для передачи в плагин
+            models_dict = {
+                'Device': Device,
+                'PluginBinding': PluginBinding,
+                'IntentMapping': IntentMapping,
+                'Plugin': Plugin,
+                'PluginVersion': PluginVersion,
+            }
+            
+            # Создаём экземпляр плагина с передачей моделей
+            plugin = plugin_class(self.app, self.db_session_maker, self.event_bus, models=models_dict)
             
             # Проверяем, включен ли плагин в БД (для плагинов, которые уже были загружены ранее)
             if not await self._is_plugin_enabled(plugin.id):
                 logger.info(f"⏭️ Plugin {plugin.id} is disabled in DB, skipping load")
                 return
+
+            # Подтягиваем сохраненную конфигурацию из БД и прокидываем в экземпляр плагина
+            # Также добавляем глобальные настройки из PluginConfigManager
+            try:
+                # Получаем глобальную конфигурацию из PluginConfigManager если доступен
+                global_config = {}
+                if hasattr(self.app.state, 'plugin_config_manager'):
+                    try:
+                        config_manager = self.app.state.plugin_config_manager
+                        plugin_config = await config_manager.get_config(plugin.id)
+                        if plugin_config:
+                            # Добавляем глобальные настройки устройств в config плагина
+                            global_config = {
+                                'device_online_timeout': plugin_config.device_online_timeout,
+                                'device_poll_interval': plugin_config.device_poll_interval
+                            }
+                            logger.debug(f"📋 Global device settings for {plugin.id}: online_timeout={plugin_config.device_online_timeout}s, poll_interval={plugin_config.device_poll_interval}s")
+                    except Exception as e:
+                        logger.debug(f"Could not get global config for {plugin.id}: {e}")
+                
+                async with get_session() as db:
+                    existing_q = await db.execute(select(Plugin).where(Plugin.id == plugin.id))
+                    existing = existing_q.scalar_one_or_none()
+                    
+                    # Инициализируем base_cfg перед использованием
+                    base_cfg = getattr(plugin, "config", None) or {}
+                    # Если base_cfg — не mapping (например, PluginConfig), попытаемся привести к dict
+                    if not isinstance(base_cfg, dict):
+                        try:
+                            if hasattr(base_cfg, '_config_cache'):
+                                base_cfg = dict(getattr(base_cfg, '_config_cache') or {})
+                            elif hasattr(base_cfg, 'dict') and callable(getattr(base_cfg, 'dict')):
+                                base_cfg = base_cfg.dict()
+                            elif hasattr(base_cfg, 'config') and isinstance(base_cfg.config, dict):
+                                base_cfg = base_cfg.config.copy()
+                            else:
+                                base_cfg = {}
+                        except Exception:
+                            base_cfg = {}
+                    
+                    if existing and existing.config:
+                        # existing.config может быть dict/JSONB
+                        persisted = existing.config if isinstance(existing.config, dict) else {}
+                        # Мержим: base_cfg -> persisted -> global_config (глобальные настройки имеют приоритет)
+                        merged = {**base_cfg, **persisted, **global_config}
+                        logger.info(f"🔧 Applied persisted config for plugin {plugin.id}: {persisted}")
+                    else:
+                        # Мержим базовую конфигурацию с глобальными настройками
+                        merged = {**base_cfg, **global_config}
+                        logger.info(f"ℹ️ No persisted config found for plugin {plugin.id}, using defaults + global settings")
+                    
+                    # Обновляем конфигурацию плагина
+                    # Если plugin.config это объект PluginConfig, обновляем его внутренний словарь
+                    if hasattr(plugin.config, 'config') and isinstance(plugin.config.config, dict):
+                        plugin.config.config.update(merged)
+                    else:
+                        # Иначе создаем словарь для доступа через config.get()
+                        plugin.config = merged
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to apply persisted config for plugin {plugin.id}: {e}")
             
             # Пытаемся загрузить manifest.json для встроенных плагинов
             if plugin_type == "builtin" and hasattr(module, '__file__'):
@@ -775,67 +957,94 @@ class PluginLoader:
                             logger.debug(f"⚠️ Failed to load manifest.json for {plugin.id}: {e}")
             
             # Вызываем on_load
-            await plugin.on_load()
+            try:
+                await plugin.on_load()
+                plugin._is_loaded = True
+            except Exception as e:
+                logger.error(f"⚠️ Plugin on_load failed for {plugin.id}: {e}", exc_info=True)
+                # Не продолжаем если on_load failed
+                return
             
-            # Регистрируем router если он есть
+            # ========== SDK v0.0.2: AUTOMATIC ROUTER MOUNTING ==========
+            # Используем встроенный метод mount_router() из SDK вместо ручной регистрации
             if plugin.router:
-                # Инфраструктурные плагины (client_manager) монтируются без префикса плагина
-                # Остальные плагины получают стандартный префикс
-                if plugin.id == "client_manager":
-                    prefix = "/api"
-                    logger.debug(f"  📍 Registered infrastructure plugin router at {prefix}")
-                else:
-                    prefix = f"/api/v1/plugins/{plugin.id}"
-                    logger.debug(f"  📍 Registered plugin router at {prefix}")
-                
-                # Capture routes BEFORE mounting
-                before_app_routes = list(self.app.routes)
-                before_router_routes = None
-                if hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
-                    try:
-                        before_router_routes = list(self.app.router.routes)
-                    except Exception:
-                        before_router_routes = None
-
-                # Mount the plugin router
-                self.app.include_router(
-                    plugin.router,
-                    prefix=prefix,
-                    tags=[plugin.name]
-                )
-
-                # Capture routes AFTER mounting and compute diff
-                added_routes = []
                 try:
-                    after_app_routes = list(self.app.routes)
-                    for r in after_app_routes:
-                        if r not in before_app_routes:
-                            added_routes.append(r)
-                except Exception:
-                    pass
-
-                try:
-                    if before_router_routes is not None and hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
-                        after_router_routes = list(self.app.router.routes)
-                        for r in after_router_routes:
-                            if r not in before_router_routes and r not in added_routes:
-                                added_routes.append(r)
-                except Exception:
-                    pass
-
-                # Save route objects for precise removal on unload
-                try:
-                    async with self._lock:
-                        self.plugin_routes[plugin.id] = added_routes
-                except Exception:
-                    self.plugin_routes[plugin.id] = added_routes
-
-                # Force regenerate OpenAPI schema so Swagger UI shows newly added routes
-                try:
-                    if hasattr(self.app, 'openapi_schema'):
-                        self.app.openapi_schema = None
-                except Exception:
-                    pass
+                    # Определяем prefix: инфраструктурные плагины (infrastructure=true в manifest) без префикса
+                    manifest = getattr(plugin, 'manifest', None) or {}
+                    is_infrastructure = (
+                        manifest.get('infrastructure', False) or
+                        getattr(plugin, 'infrastructure', False) or
+                        manifest.get('type') == 'infrastructure'
+                    )
+                    
+                    if is_infrastructure:
+                        # Инфраструктурные плагины монтируются на /api без префикса плагина
+                        custom_prefix = "/api"
+                        logger.debug(f"  🏗️ Infrastructure plugin {plugin.id} mounted at {custom_prefix}")
+                    else:
+                        custom_prefix = f"/api/plugins/{plugin.id}"
+                    
+                    # Модифицируем mount_router для использования custom prefix
+                    async def custom_mount():
+                        if plugin.router and not plugin._router_mounted:
+                            before_app_routes = list(self.app.routes)
+                            before_router_routes = None
+                            if hasattr(self.app, 'router') and hasattr(self.app.router, 'routes'):
+                                try:
+                                    before_router_routes = list(self.app.router.routes)
+                                except Exception:
+                                    pass
+                            
+                            # Монтируем router
+                            self.app.include_router(
+                                plugin.router,
+                                prefix=custom_prefix,
+                                tags=[plugin.name]
+                            )
+                            plugin._router_mounted = True
+                            logger.info(f"✅ Router mounted at {custom_prefix}")
+                            
+                            # Сохраняем добавленные routes для удаления
+                            added_routes = []
+                            try:
+                                after_app_routes = list(self.app.routes)
+                                for r in after_app_routes:
+                                    if r not in before_app_routes:
+                                        added_routes.append(r)
+                            except Exception:
+                                pass
+                            
+                            try:
+                                if before_router_routes is not None and hasattr(self.app, 'router'):
+                                    after_router_routes = list(self.app.router.routes)
+                                    for r in after_router_routes:
+                                        if r not in before_router_routes and r not in added_routes:
+                                            added_routes.append(r)
+                            except Exception:
+                                pass
+                            
+                            # Сохраняем route objects
+                            try:
+                                async with self._lock:
+                                    self.plugin_routes[plugin.id] = added_routes
+                            except Exception:
+                                self.plugin_routes[plugin.id] = added_routes
+                            
+                            # Force regenerate OpenAPI schema
+                            try:
+                                if hasattr(self.app, 'openapi_schema'):
+                                    self.app.openapi_schema = None
+                            except Exception:
+                                pass
+                    
+                    # Вызываем модифицированный mount
+                    await custom_mount()
+                    
+                except Exception as e:
+                    logger.error(f"❌ Failed to mount router for {plugin.id}: {e}", exc_info=True)
+                    # Не прерываем загрузку плагина
+            else:
+                logger.debug(f"  ℹ️ Plugin {plugin.id} has no router to mount")
             
             # Сохраняем в реестр
             try:
@@ -1181,21 +1390,66 @@ class PluginLoader:
         try:
             logger.info(f"📦 Installing dependencies for plugin {plugin_id}")
             
-            # Используем pip для установки зависимостей
-            # --user позволяет устанавливать без sudo
-            # --no-warn-script-location убирает предупреждения
+            # Определяем, нужно ли использовать --user
+            # В Docker контейнере или при работе от root можно устанавливать в системный site-packages
+            use_user_flag = True
+            if os.path.exists('/.dockerenv') or os.getenv('DOCKER_CONTAINER'):
+                # В Docker контейнере обычно работаем от root, можно без --user
+                use_user_flag = False
+                logger.debug("🐳 Running in Docker, installing to system site-packages")
+            elif os.geteuid() == 0:
+                # Работаем от root, можно без --user
+                use_user_flag = False
+                logger.debug("🔑 Running as root, installing to system site-packages")
+            
+            # Формируем команду pip
+            pip_cmd = [sys.executable, '-m', 'pip', 'install', '-r', requirements_file, '--no-warn-script-location', '--no-cache-dir']
+            if use_user_flag:
+                pip_cmd.append('--user')
+            
             result = subprocess.run(
-                [sys.executable, '-m', 'pip', 'install', '-r', requirements_file, '--user', '--no-warn-script-location'],
+                pip_cmd,
                 capture_output=True,
                 text=True,
                 timeout=300  # 5 минут таймаут
             )
             
             if result.returncode == 0:
+                # Добавляем путь к user site-packages в sys.path только если использовали --user
+                # Это нужно, чтобы Python мог найти только что установленные пакеты
+                if use_user_flag:
+                    try:
+                        user_site = site.getusersitepackages()
+                        if user_site and os.path.exists(user_site):
+                            if user_site not in sys.path:
+                                sys.path.insert(0, user_site)
+                                logger.debug(f"📦 Added user site-packages to sys.path: {user_site}")
+                            
+                            # Также пробуем добавить через site.addsitedir для правильной инициализации
+                            site.addsitedir(user_site)
+                            logger.debug(f"📦 Initialized user site-packages: {user_site}")
+                    except Exception as e:
+                        logger.debug(f"Could not add user site-packages to sys.path: {e}")
+                else:
+                    # При установке в системный site-packages просто перезагружаем site
+                    # чтобы Python увидел новые пакеты
+                    try:
+                        import importlib
+                        importlib.reload(site)
+                        logger.debug("📦 Reloaded site module to detect new packages")
+                    except Exception as e:
+                        logger.debug(f"Could not reload site module: {e}")
+                
+                # Проверяем, что пакеты действительно установились
+                if result.stdout:
+                    logger.debug(f"📦 Pip output: {result.stdout[:500]}")  # Первые 500 символов
+                
                 logger.info(f"✅ Dependencies installed for plugin {plugin_id}")
                 return {'status': 'installed', 'output': result.stdout}
             else:
                 logger.error(f"❌ Failed to install dependencies for plugin {plugin_id}: {result.stderr}")
+                if result.stdout:
+                    logger.debug(f"📦 Pip stdout: {result.stdout[:500]}")
                 return {'status': 'failed', 'error': result.stderr}
                 
         except subprocess.TimeoutExpired:

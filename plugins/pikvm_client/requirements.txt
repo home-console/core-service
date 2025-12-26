@@ -1,0 +1,10 @@
+requests
+pydantic
+python-dotenv
+websocket-client
+grpcio
+grpcio-tools
+protobuf
+pymongo
+urllib3
+pyotp

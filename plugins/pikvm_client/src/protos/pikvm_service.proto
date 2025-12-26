@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package pikvm;
+
+// Service for controlling PI-KVM device
+service PikvmControlService {
+    // Power control methods
+    rpc PowerControl(PowerControlRequest) returns (CommandResponse) {}
+    rpc ButtonClick(ButtonClickRequest) returns (CommandResponse) {}
+    
+    // Media and storage methods
+    rpc UploadMSDImage(MSDUploadRequest) returns (CommandResponse) {}
+    
+    // GPIO control methods
+    rpc SwitchGPIO(GPIOControlRequest) returns (CommandResponse) {}
+    rpc PulseGPIO(GPIOControlRequest) returns (CommandResponse) {}
+}
+
+// Power control request
+message PowerControlRequest {
+    enum Action {
+        ON = 0;
+        OFF = 1;
+        OFF_HARD = 2;
+        RESET_HARD = 3;
+    }
+    Action action = 1;
+    bool wait = 2;
+}
+
+// Button click request
+message ButtonClickRequest {
+    enum Button {
+        POWER = 0;
+        POWER_LONG = 1;
+        RESET = 2;
+    }
+    Button button = 1;
+    bool wait = 2;
+}
+
+// MSD Image Upload request
+message MSDUploadRequest {
+    string image_path = 1;
+    string image_name = 2;
+}
+
+// GPIO control request
+message GPIOControlRequest {
+    int32 channel = 1;
+    int32 state = 2;
+    bool wait = 3;
+    float pulse_delay = 4;
+}
+
+// Generic command response
+message CommandResponse {
+    bool success = 1;
+    string message = 2;
+}

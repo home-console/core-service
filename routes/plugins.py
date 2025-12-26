@@ -1358,7 +1358,7 @@ async def registry_get(name: str):
 
 
 # Internal plugins API
-@router.get("/v1/admin/plugins")
+@router.get("/admin/plugins")
 async def list_admin_plugins(request: Request):
     """List all loaded internal plugins."""
     app = request.app
@@ -1567,30 +1567,33 @@ async def get_stats(request: Request):
     return standard_response(data={"status": "running", "plugins_loaded": plugin_count, "version": "2.0.0"})
 
 
-# IMPORTANT: This catch-all route MUST be last to avoid conflicts
-# It proxies requests to external HTTP plugins
-@router.api_route("/plugins/{plugin_id}/{path:path}", methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
-async def proxy_to_external_plugin(plugin_id: str, path: str, request: Request):
-    """Proxy requests to external plugins."""
-    body = None
-    if request.method in ('POST', 'PUT', 'PATCH'):
-        try:
-            body = await request.json()
-        except Exception:
-            body = None
-
-    try:
-        result = await external_plugin_registry.proxy_request(
-            plugin_id=plugin_id,
-            path=path,
-            method=request.method,
-            json=body,
-            params=dict(request.query_params),
-            headers=dict(request.headers)
-        )
-        return result
-    except LookupError:
-        raise HTTPException(status_code=404, detail=f"External plugin '{plugin_id}' not registered")
-    except Exception as e:
-        logger.error(f"Proxy error for {plugin_id}: {e}")
-        raise HTTPException(status_code=502, detail=str(e))
+# NOTE: Catch-all route for external plugins is DISABLED
+# Internal plugins mount their own routers with prefix /api/plugins/{plugin_id}
+# External plugins use external_plugin_registry.proxy_request directly
+# 
+# If you need to proxy to external HTTP plugins, uncomment and adjust:
+# @router.api_route("/plugins/{plugin_id}/{path:path}", methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
+# async def proxy_to_external_plugin(plugin_id: str, path: str, request: Request):
+#     """Proxy requests to external plugins."""
+#     body = None
+#     if request.method in ('POST', 'PUT', 'PATCH'):
+#         try:
+#             body = await request.json()
+#         except Exception:
+#             body = None
+#
+#     try:
+#         result = await external_plugin_registry.proxy_request(
+#             plugin_id=plugin_id,
+#             path=path,
+#             method=request.method,
+#             json=body,
+#             params=dict(request.query_params),
+#             headers=dict(request.headers)
+#         )
+#         return result
+#     except LookupError:
+#         raise HTTPException(status_code=404, detail=f"External plugin '{plugin_id}' not registered")
+#     except Exception as e:
+#         logger.error(f"Proxy error for {plugin_id}: {e}")
+#         raise HTTPException(status_code=502, detail=str(e))

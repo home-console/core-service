@@ -46,6 +46,9 @@ class PluginConfig:
     dependencies: list[str] = field(default_factory=list)
     supported_modes: list[PluginMode] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Глобальные настройки для устройств (могут быть переопределены в config плагина)
+    device_online_timeout: int = 300  # Время в секундах, после которого устройство считается оффлайн (по умолчанию 5 минут)
+    device_poll_interval: int = 60  # Интервал опроса устройств в секундах (по умолчанию 1 минута)
 
 
 class PluginConfigManager:
@@ -184,6 +187,13 @@ class PluginConfigManager:
             if 'metadata' in config_data:
                 config.metadata.update(config_data['metadata'])
             
+            # Глобальные настройки для устройств
+            if 'device_online_timeout' in config_data:
+                config.device_online_timeout = int(config_data['device_online_timeout'])
+            
+            if 'device_poll_interval' in config_data:
+                config.device_poll_interval = int(config_data['device_poll_interval'])
+            
             config.source = source
             
             logger.info(f"Loaded config for plugin {plugin_id} from {source.value}")
@@ -230,6 +240,9 @@ class PluginConfigManager:
                         setattr(config, key, supported_modes)
                     else:
                         setattr(config, key, value)
+                elif key in ['device_online_timeout', 'device_poll_interval']:
+                    # Глобальные настройки для устройств
+                    setattr(config, key, int(value) if isinstance(value, (int, str)) else value)
                 else:
                     # Добавляем в пользовательскую конфигурацию
                     config.config[key] = value
@@ -255,7 +268,9 @@ class PluginConfigManager:
             'resources': config.resources,
             'dependencies': config.dependencies,
             'supported_modes': [m.value for m in config.supported_modes],
-            'metadata': config.metadata
+            'metadata': config.metadata,
+            'device_online_timeout': config.device_online_timeout,
+            'device_poll_interval': config.device_poll_interval
         }
         
         try:
@@ -302,7 +317,10 @@ class PluginConfigManager:
             'restart_policy': config.restart_policy,
             'resources': config.resources.copy(),
             'dependencies': config.dependencies.copy(),
-            'metadata': config.metadata.copy()
+            'metadata': config.metadata.copy(),
+            # Глобальные настройки для устройств
+            'device_online_timeout': config.device_online_timeout,
+            'device_poll_interval': config.device_poll_interval
         })
 
         # Для инфраструктурных плагинов (например, client_manager) используем специфичную логику
@@ -336,6 +354,14 @@ class PluginConfigManager:
     
     async def get_default_config(self, plugin_id: str) -> PluginConfig:
         """Получить конфигурацию по умолчанию для плагина"""
+        # Можно переопределить значения по умолчанию для конкретных плагинов
+        default_online_timeout = 300  # 5 минут по умолчанию
+        default_poll_interval = 60  # 1 минута по умолчанию
+        
+        # Для yandex_smart_home можно установить другие значения
+        if plugin_id == 'yandex_smart_home':
+            default_poll_interval = 300  # 5 минут для Яндекс
+        
         return PluginConfig(
             plugin_id=plugin_id,
             mode=PluginMode.IN_PROCESS,
@@ -346,7 +372,9 @@ class PluginConfigManager:
             resources={},
             dependencies=[],
             supported_modes=[PluginMode.IN_PROCESS],
-            metadata={}
+            metadata={},
+            device_online_timeout=default_online_timeout,
+            device_poll_interval=default_poll_interval
         )
 
 

@@ -41,6 +41,31 @@
     "AUTH_SERVICE_BASE",
     "INTERNAL_SERVICE_TOKEN"
   ],
+  "config_schema": {
+    "sync_interval": {
+      "type": "integer",
+      "default": 300,
+      "description": "Interval in seconds for automatic device synchronization (0 to disable). If not set, uses device_poll_interval from core config",
+      "minimum": 0
+    },
+    "full_sync_on_periodic": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether to perform full device data sync (capabilities, properties) on periodic sync (slower but more complete)"
+    },
+    "device_online_timeout": {
+      "type": "integer",
+      "default": 300,
+      "description": "Time in seconds after which device is considered offline (inherited from core config if not set)",
+      "minimum": 1
+    },
+    "device_poll_interval": {
+      "type": "integer",
+      "default": 300,
+      "description": "Interval in seconds for polling device states (inherited from core config if not set)",
+      "minimum": 1
+    }
+  },
   "api_endpoints": [
     {
       "path": "/api/plugins/yandex_smart_home/start_oauth",

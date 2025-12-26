@@ -4,6 +4,18 @@ Creates FastAPI app at import time so uvicorn can use --reload.
 """
 import os
 import sys
+import logging
+
+# Настроить логирование сразу
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger(__name__)
+
+print("🔵 ASGI: Starting import...")
+logger.info("🔵 ASGI: Starting import...")
 
 # Ensure we're treated as part of core_service package
 if not __package__:
@@ -18,8 +30,15 @@ _parent_dir = os.path.dirname(_current_dir)  # /app/core_service -> /app
 if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
-# Import app factory - use relative imports which work when imported as core_service.asgi
-from .app import create_admin_app
+print("🔵 ASGI: About to import create_admin_app...")
+logger.info("🔵 ASGI: About to import create_admin_app...")
 
-# Create app instance
-app = create_admin_app()
+# Import app instance directly - it's created at module level in app.py
+print("🔵 ASGI: About to import app...")
+sys.stdout.flush()
+
+from .app import app
+
+print("✅ ASGI: Successfully imported app")
+logger.info("✅ ASGI: Successfully imported app")
+sys.stdout.flush()
