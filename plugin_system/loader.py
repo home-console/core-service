@@ -24,11 +24,11 @@ from pathlib import Path
 
 from .core.base import InternalPluginBase
 try:
-    from ..event_bus import event_bus
+    from ..event_bus import EventBus
     from ..models import Device, PluginBinding, IntentMapping, Plugin, PluginVersion
     from ..db import get_session
 except ImportError:
-    from core_service.event_bus import event_bus
+    from core_service.event_bus import EventBus
     from core_service.models import Device, PluginBinding, IntentMapping, Plugin, PluginVersion
     from core_service.db import get_session
 
@@ -49,17 +49,22 @@ class PluginLoader:
     Использует модульную архитектуру для разделения ответственности.
     """
     
-    def __init__(self, app, db_session_maker):
+    def __init__(self, app, db_session_maker, event_bus: Optional[EventBus] = None):
         """
         Инициализация загрузчика.
         
         Args:
             app: FastAPI приложение
             db_session_maker: async_sessionmaker для БД
+            event_bus: EventBus экземпляр (создается автоматически если не передан)
         """
         self.app = app
         self.db_session_maker = db_session_maker
-        self.event_bus = event_bus
+        # Создаем event_bus если не передан (для обратной совместимости)
+        if event_bus is None:
+            self.event_bus = EventBus()
+        else:
+            self.event_bus = event_bus
         self.plugins: Dict[str, InternalPluginBase] = {}
         
         # Директория с внешними плагинами (из переменной окружения)
@@ -91,14 +96,97 @@ class PluginLoader:
             await self._load_external_plugins()
     
     async def _load_builtin_plugins(self):
-        """Загрузить встроенные плагины из core-service/plugins/"""
+        """Загрузить встроенные плагины из core-service/plugins/ (параллельно)"""
         plugin_modules = PluginFinder.find_builtin_plugins()
         
         if not plugin_modules:
             return
         
+        # Параллельная загрузка с ограничением concurrency
+        semaphore = asyncio.Semaphore(5)  # Максимум 5 плагинов одновременно
+        
+        async def load_single_plugin(module_name: str, is_package: bool) -> tuple[str, bool, Optional[Exception]]:
+            """Загрузить один плагин с изоляцией ошибок"""
+            async with semaphore:
+                try:
+                    if is_package:
+                        # Для пакетов проверяем и устанавливаем зависимости
+                        try:
+                            plugin_dir_name = module_name.split('.')[-1]
+                            # Получаем путь к плагину
+                            try:
+                                import core_service.plugins as plugins_package
+                                base_path = plugins_package.__path__[0]
+                            except ImportError:
+                                import plugins as plugins_package
+                                base_path = plugins_package.__path__[0]
+                            
+                            plugin_path = os.path.join(base_path, plugin_dir_name)
+                            if os.path.isdir(plugin_path):
+                                requirements_file = os.path.join(plugin_path, 'requirements.txt')
+                                if os.path.exists(requirements_file):
+                                    logger.info(f"📦 Found requirements.txt for builtin plugin {plugin_dir_name}, installing dependencies...")
+                                    deps_result = await asyncio.to_thread(
+                                        PluginDependencyInstaller.install_dependencies,
+                                        plugin_path,
+                                        plugin_dir_name
+                                    )
+                                    if deps_result.get('status') == 'installed':
+                                        logger.info(f"✅ Dependencies installed for plugin {plugin_dir_name}")
+                                    elif deps_result.get('status') == 'failed':
+                                        logger.warning(f"⚠️ Failed to install dependencies for {plugin_dir_name}: {deps_result.get('error')}")
+                        except Exception as e:
+                            logger.debug(f"Could not check/install dependencies for {module_name}: {e}")
+                        
+                        # Пробуем загрузить модуль и найти класс плагина
+                        try:
+                            module = importlib.import_module(module_name)
+                            plugin_class = self._find_plugin_class(module)
+                            
+                            if plugin_class:
+                                logger.info(f"🔄 Attempting to load plugin from package: {module_name}")
+                                await self.load_plugin(module_name, plugin_type="builtin")
+                                return (module_name, True, None)
+                            else:
+                                logger.debug(f"⏭️ No plugin class found in package: {module_name}")
+                                return (module_name, False, None)
+                        except Exception as e:
+                            logger.error(f"❌ Failed to load plugin package {module_name}: {e}", exc_info=True)
+                            return (module_name, False, e)
+                    else:
+                        # Обычный модуль (файл .py)
+                        logger.info(f"🔄 Attempting to load plugin: {module_name}")
+                        try:
+                            await self.load_plugin(module_name, plugin_type="builtin")
+                            return (module_name, True, None)
+                        except Exception as e:
+                            logger.error(f"❌ Failed to load plugin {module_name}: {e}", exc_info=True)
+                            return (module_name, False, e)
+                except Exception as e:
+                    logger.error(f"❌ Unexpected error loading plugin {module_name}: {e}", exc_info=True)
+                    return (module_name, False, e)
+        
+        # Загружаем все плагины параллельно
+        tasks = [
+            load_single_plugin(module_name, is_package)
+            for module_name, is_package in plugin_modules
+        ]
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Подсчитываем успешно загруженные
         loaded_count = 0
-        for module_name, is_package in plugin_modules:
+        failed_count = 0
+        for result in results:
+            if isinstance(result, Exception):
+                failed_count += 1
+                logger.error(f"Plugin loading task failed: {result}", exc_info=True)
+            elif isinstance(result, tuple):
+                module_name, success, error = result
+                if success:
+                    loaded_count += 1
+                else:
+                    failed_count += 1
             if is_package:
                 # Для пакетов проверяем и устанавливаем зависимости
                 try:
@@ -151,6 +239,8 @@ class PluginLoader:
                     logger.error(f"❌ Failed to load plugin {module_name}: {e}", exc_info=True)
         
         logger.info(f"✅ Successfully loaded {loaded_count} builtin plugin(s)")
+        if failed_count > 0:
+            logger.warning(f"⚠️ Failed to load {failed_count} builtin plugin(s)")
     
     async def _load_external_plugins(self):
         """Загрузить внешние плагины из PLUGINS_DIR"""

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, DateTime, Text, Boolean
+from sqlalchemy import Column, String, Integer, DateTime, Text, Boolean, Index
 from sqlalchemy import JSON
 
 # Импортируем Base из db.py для совместимости с async engine
@@ -32,11 +32,16 @@ class PluginBinding(Base):
     __tablename__ = "plugin_bindings"
     id = Column(String(128), primary_key=True)
     device_id = Column(String(128), index=True, nullable=False)
-    plugin_name = Column(String(128), nullable=False)
-    selector = Column(String(255), nullable=True)  # Внешний идентификатор устройства (например, yandex_device_id)
+    plugin_name = Column(String(128), index=True, nullable=False)  # Добавлен индекс для частых запросов
+    selector = Column(String(255), nullable=True)
     config = Column(JSON, nullable=True)
     enabled = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Составной индекс для частого запроса: device_id + enabled (для фильтрации активных привязок)
+    __table_args__ = (
+        Index('idx_device_enabled', 'device_id', 'enabled'),
+        Index('idx_plugin_enabled', 'plugin_name', 'enabled'),
+    )
 
 
 class IntentMapping(Base):

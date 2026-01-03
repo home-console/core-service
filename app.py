@@ -32,41 +32,27 @@ for handler in logging.root.handlers:
 logging.getLogger("core_service").setLevel(logging.INFO)
 logging.getLogger("event_bus").setLevel(logging.INFO)
 logging.getLogger("routes").setLevel(logging.INFO)
-print("🔵 app.py: Log levels set")
+
+# Инициализируем logger для этого модуля
+logger = logging.getLogger(__name__)
+logger.info("Log levels configured")
 
 # Подключить коллектор логов для просмотра через API (отложим до конца импортов)
-print("🔵 app.py: Importing log_collector module (handler will be added later)...")
-sys.stdout.flush()
+logger.debug("Importing log_collector module (handler will be added later)")
 try:
     from .utils.log_collector import application_log_collector
-    print("✅ app.py: log_collector module imported (handler not added yet)")
-    sys.stdout.flush()
+    logger.debug("log_collector module imported (handler not added yet)")
 except Exception as e:
     # Если не удалось импортировать, продолжаем без коллектора
-    print(f"⚠️ app.py: Failed to import log_collector: {e}")
-    import traceback
-    traceback.print_exc()
+    logger.warning(f"Failed to import log_collector: {e}")
     application_log_collector = None
-    sys.stdout.flush()
 
-print("🔵 app.py: About to import FastAPI...")
-sys.stdout.flush()  # Принудительно сбросить буфер вывода
-logging.info("🔵 app.py: About to import FastAPI (via logging)")
-print("🔵 app.py: Importing FastAPI...")
-sys.stdout.flush()
-logging.info("🔵 app.py: Importing FastAPI (via logging)")
-
+logger.debug("About to import FastAPI")
 try:
     from fastapi import FastAPI
-    print("✅ app.py: FastAPI imported")
-    logging.info("✅ app.py: FastAPI imported (via logging)")
-    sys.stdout.flush()
+    logger.debug("FastAPI imported")
 except Exception as e:
-    print(f"❌ app.py: Failed to import FastAPI: {e}")
-    logging.error(f"❌ app.py: Failed to import FastAPI: {e}", exc_info=True)
-    import traceback
-    traceback.print_exc()
-    sys.stdout.flush()
+    logger.error(f"Failed to import FastAPI: {e}", exc_info=True)
     raise
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -74,8 +60,8 @@ from sqladmin import Admin, ModelView
 import sqlalchemy as sa
 from sqlalchemy import text
 
-print("🔵 app.py: Importing core modules...")
 # Relative imports - try relative first, then absolute with package prefix
+logger.debug("Importing core modules")
 try:
     from .db import engine, get_session, AsyncSessionLocal
     from .models import Base
@@ -89,11 +75,9 @@ try:
         init_plugin_dependency_manager,
     )
     from .health_monitor import HealthMonitor
-    print("✅ app.py: Core modules imported")
+    logger.debug("Core modules imported")
 except ImportError as e:
-    print(f"❌ app.py: Failed to import core modules: {e}")
-    import traceback
-    traceback.print_exc()
+    logger.error(f"Failed to import core modules: {e}", exc_info=True)
     raise
 
 # Client, CommandLog, Enrollment models are now in plugins/client_manager/models.py
@@ -102,20 +86,20 @@ Client = None
 CommandLog = None
 Enrollment = None
 
-print("🔵 app.py: Trying to import client_manager models...")
+logger.debug("Trying to import client_manager models")
 try:
     # Try relative import first
     from .plugins.client_manager.models import Client, CommandLog, Enrollment
-    print("✅ app.py: client_manager models imported")
+    logger.debug("client_manager models imported")
 except ImportError:
     try:
         # Try absolute import with package prefix
         from core_service.plugins.client_manager.models import Client, CommandLog, Enrollment
-        print("✅ app.py: client_manager models imported (absolute)")
+        logger.debug("client_manager models imported (absolute)")
     except ImportError:
         # Models not available - plugin may not be loaded yet or path is wrong
         # This is OK - SQLAdmin views will be skipped
-        print("⚠️ app.py: client_manager models not available (this is OK)")
+        logger.debug("client_manager models not available (this is OK)")
 
 # Core models (always defined in core-service/models.py) - import with fallback
 Device = None
@@ -127,18 +111,18 @@ PluginVersion = None
 PluginInstallJob = None
 User = None
 
-print("🔵 app.py: Importing core models...")
+logger.debug("Importing core models")
 try:
     from .models import Device, PluginBinding, IntentMapping, DeviceLink, Plugin, PluginVersion, PluginInstallJob, User
-    print("✅ app.py: Core models imported")
+    logger.debug("Core models imported")
 except ImportError as e:
-    print(f"⚠️ app.py: Failed to import core models: {e}")
+    logger.warning(f"Failed to import core models: {e}")
     try:
         from core_service.models import Device, PluginBinding, IntentMapping, DeviceLink, Plugin, PluginVersion, PluginInstallJob, User
-        print("✅ app.py: Core models imported (absolute)")
+        logger.debug("Core models imported (absolute)")
     except ImportError:
         # If models can't be imported, leave as None; admin views will be skipped
-        print("⚠️ app.py: Core models not available (this is OK)")
+        logger.debug("Core models not available (this is OK)")
 
 logger = logging.getLogger(__name__)
 
@@ -148,18 +132,11 @@ _health_monitor = None
 # Добавить handler к root logger после всех импортов (чтобы избежать проблем с рекурсией)
 if application_log_collector is not None:
     try:
-        print("🔵 app.py: Adding log collector handler to root logger (after imports)...")
-        sys.stdout.flush()
         root_logger = logging.getLogger()
         root_logger.addHandler(application_log_collector)
-        print("✅ app.py: Log collector handler added successfully")
-        sys.stdout.flush()
-        # Не вызываем logging.info здесь, чтобы избежать рекурсии
+        logger.debug("Log collector handler added successfully")
     except Exception as e:
-        print(f"⚠️ app.py: Failed to add log collector handler: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.stdout.flush()
+        logger.warning(f"Failed to add log collector handler: {e}", exc_info=True)
 
 
 # ============= SQLAdmin Model Views =============
@@ -319,12 +296,10 @@ def register_external_plugins_from_env() -> list:
 async def lifespan(app: FastAPI):
     """Application lifecycle manager - startup and shutdown logic."""
     # Startup
-    print("🚀 Starting application lifecycle...")
     logger.info("🚀 Starting application lifecycle...")
     
     try:
         # Создаем таблицы асинхронно
-        print("📦 Creating database tables...")
         logger.info("📦 Creating database tables...")
         try:
             async with engine.begin() as conn:
@@ -369,21 +344,16 @@ async def lifespan(app: FastAPI):
                 await conn.run_sync(_ensure_plugin_columns)
         except Exception as e:
             logger.error(f"❌ Failed to create database tables: {e}", exc_info=True)
-            print(f"❌ Failed to create database tables: {e}")
             raise
     
         logger.info("✅ Database tables ready")
-        print("✅ Database tables ready")
         
         # Load internal plugins
         logger.info("🔌 Loading plugins...")
-        print("🔌 Loading plugins...")
         try:
-            # Import event_bus with fallback
-            try:
-                from .event_bus import event_bus
-            except ImportError:
-                from core_service.event_bus import event_bus
+            # Создаем event_bus здесь, а не используем глобальный singleton
+            from .event_bus import EventBus
+            event_bus = EventBus()
             
             import asyncio
 
@@ -391,10 +361,10 @@ async def lifespan(app: FastAPI):
             from .routes.auth import get_current_user
             app.state.get_current_user = get_current_user
 
-            # Передаём async_sessionmaker (`AsyncSessionLocal`) в PluginLoader —
+            # Передаём async_sessionmaker (`AsyncSessionLocal`) и event_bus в PluginLoader —
             # плагины ожидают объект session_maker (async_sessionmaker), а не
             # контекстный менеджер `get_session`.
-            plugin_loader = PluginLoader(app, AsyncSessionLocal)
+            plugin_loader = PluginLoader(app, AsyncSessionLocal, event_bus=event_bus)
             await plugin_loader.load_all()
 
             # Save to app state for access from endpoints
@@ -431,7 +401,7 @@ async def lifespan(app: FastAPI):
 
                 logger.info("✅ All plugin managers initialized")
             except Exception as e:
-                logger.error(f"❌ Failed to initialize plugin managers: {e}")
+                logger.error(f"❌ Failed to initialize plugin managers: {e}", exc_info=True)
             
             # Force OpenAPI schema regeneration after all plugins are loaded
             # This ensures Swagger UI shows all plugin routes
@@ -448,8 +418,8 @@ async def lifespan(app: FastAPI):
                 res = await external_plugin_registry.health_check_all()
                 for pid, ok in res.items():
                     logger.info(f"{'✅' if ok else '❌'} {pid}: {'healthy' if ok else 'unhealthy'}")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to perform initial health checks: {e}", exc_info=True)
             
             # Start health monitor if enabled
             global _health_monitor
@@ -459,63 +429,89 @@ async def lifespan(app: FastAPI):
                 await _health_monitor.start()
         except Exception as e:
             logger.error(f"❌ Failed to load internal plugins: {e}", exc_info=True)
-            print(f"❌ Failed to load internal plugins: {e}")
             raise
         
         logger.info("✅ Application startup complete")
-        print("✅ Application startup complete")
     except Exception as e:
         logger.error(f"❌ CRITICAL: Failed during application startup: {e}", exc_info=True)
-        print(f"❌ CRITICAL: Failed during application startup: {e}")
-        import traceback
-        traceback.print_exc()
         raise  # Перебрасываем ошибку, чтобы приложение не запустилось в нерабочем состоянии
     
     yield
     
     logger.info("🛑 Application shutdown started")
-    print("🛑 Application shutdown started")
     
-    # Shutdown
-    try:
-        if _health_monitor is not None:
+    # Graceful shutdown с логированием всех ошибок
+    shutdown_errors = []
+    
+    # Shutdown health monitor
+    if _health_monitor is not None:
+        try:
             await _health_monitor.stop()
-    except Exception:
-        pass
-    try:
-        # Cleanup plugin managers
-        if hasattr(app.state, 'plugin_mode_manager'):
+            logger.debug("Health monitor stopped")
+        except Exception as e:
+            shutdown_errors.append(f"health_monitor: {e}")
+            logger.error(f"Failed to stop health monitor: {e}", exc_info=True)
+    
+    # Cleanup plugin managers
+    if hasattr(app.state, 'plugin_mode_manager'):
+        try:
             await app.state.plugin_mode_manager.cleanup()
-    except Exception:
-        pass
-    try:
-        # Cleanup lifecycle manager
-        if hasattr(app.state, 'plugin_lifecycle_manager'):
+            logger.debug("Plugin mode manager cleaned up")
+        except Exception as e:
+            shutdown_errors.append(f"plugin_mode_manager: {e}")
+            logger.error(f"Failed to cleanup plugin mode manager: {e}", exc_info=True)
+    
+    # Cleanup lifecycle manager
+    if hasattr(app.state, 'plugin_lifecycle_manager'):
+        try:
             await app.state.plugin_lifecycle_manager.cleanup()
-    except Exception:
-        pass
-    try:
-        # Cleanup dependency manager
-        if hasattr(app.state, 'plugin_dependency_manager'):
-            # No cleanup needed for dependency manager
-            pass
-    except Exception:
-        pass
+            logger.debug("Plugin lifecycle manager cleaned up")
+        except Exception as e:
+            shutdown_errors.append(f"plugin_lifecycle_manager: {e}")
+            logger.error(f"Failed to cleanup plugin lifecycle manager: {e}", exc_info=True)
+    
+    # Cleanup dependency manager (no cleanup needed, but log for consistency)
+    if hasattr(app.state, 'plugin_dependency_manager'):
+        logger.debug("Plugin dependency manager (no cleanup needed)")
+    
+    # Close external plugin registry
     try:
         await external_plugin_registry.aclose()
-    except Exception:
-        pass
+        logger.debug("External plugin registry closed")
+    except Exception as e:
+        shutdown_errors.append(f"external_plugin_registry: {e}")
+        logger.error(f"Failed to close external plugin registry: {e}", exc_info=True)
+    
+    # Close HTTP client
     try:
-        # Закрываем HTTP клиент
         from .utils.http_client import _close_http_client
         await _close_http_client()
-    except Exception:
-        pass
+        logger.debug("HTTP client closed")
+    except Exception as e:
+        shutdown_errors.append(f"http_client: {e}")
+        logger.error(f"Failed to close HTTP client: {e}", exc_info=True)
+    
+    # Close Redis cache
     try:
-        # Закрываем async engine
+        from .utils.cache import close_cache
+        await close_cache()
+        logger.debug("Redis cache closed")
+    except Exception as e:
+        shutdown_errors.append(f"redis_cache: {e}")
+        logger.error(f"Failed to close Redis cache: {e}", exc_info=True)
+    
+    # Close database engine
+    try:
         await engine.dispose()
-    except Exception:
-        pass
+        logger.debug("Database engine disposed")
+    except Exception as e:
+        shutdown_errors.append(f"database_engine: {e}")
+        logger.error(f"Failed to dispose database engine: {e}", exc_info=True)
+    
+    if shutdown_errors:
+        logger.warning(f"Shutdown completed with {len(shutdown_errors)} error(s)")
+    else:
+        logger.info("✅ Application shutdown completed successfully")
 
 
 # ============= Application Factory =============

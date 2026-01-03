@@ -11,7 +11,7 @@
 - ✅ Управление GPIO (переключение и импульсы)
 - ✅ Управление Mass Storage Device (MSD)
 - ✅ Мониторинг через WebSocket
-- ✅ Сохранение событий WebSocket в MongoDB (опционально)
+- ✅ Поддержка нескольких устройств одновременно
 
 ## Установка
 
@@ -29,13 +29,53 @@ pip install -r requirements.txt
 - `pydantic`
 - `python-dotenv`
 - `websocket-client`
-- `pymongo` (опционально, для MongoDB)
 - `urllib3`
 - `pyotp`
 
 ## Конфигурация
 
-### Переменные окружения
+### Поддержка нескольких устройств
+
+Плагин поддерживает работу с несколькими устройствами PiKVM одновременно. Каждое устройство должно иметь уникальный `device_id`.
+
+### Конфигурация через UI (рекомендуется)
+
+Плагин можно настроить через веб-интерфейс Home Console:
+1. Перейдите в раздел "Плагины"
+2. Найдите "PiKVM Client Service"
+3. Нажмите "Настроить"
+4. Заполните параметры конфигурации
+
+#### Формат конфигурации (JSON)
+
+```json
+{
+  "devices": [
+    {
+      "device_id": "pikvm-server1",
+      "host": "192.168.1.100",
+      "username": "admin",
+      "password": "password1",
+      "secret": null,
+      "enabled": true
+    },
+    {
+      "device_id": "pikvm-server2",
+      "host": "192.168.1.101",
+      "username": "admin",
+      "password": "password2",
+      "secret": null,
+      "enabled": true
+    }
+  ],
+  "enable_websocket": true,
+  "debug": false
+}
+```
+
+### Переменные окружения (обратная совместимость)
+
+Для одного устройства можно использовать старый формат:
 
 ```bash
 # Обязательные
@@ -45,27 +85,45 @@ PIKVM_PASSWORD=your_password       # Пароль
 
 # Опциональные
 PIKVM_SECRET=                      # TOTP секрет для двухфакторной аутентификации
-MONGODB_URI=mongodb://localhost:27017/  # URI для MongoDB (опционально)
-MONGODB_DATABASE=pikvm_data       # Имя базы данных MongoDB
-MONGODB_COLLECTION=websocket_events # Коллекция для событий WebSocket
 DEBUG=false                        # Включить отладочное логирование
 ```
-
-### Конфигурация через UI
-
-Плагин можно настроить через веб-интерфейс Home Console:
-1. Перейдите в раздел "Плагины"
-2. Найдите "PiKVM Client Service"
-3. Нажмите "Настроить"
-4. Заполните параметры конфигурации
 
 ## API Endpoints
 
 Все endpoints доступны по префиксу `/api/plugins/pikvm_client/`
 
+### Список устройств
+
+```http
+GET /api/plugins/pikvm_client/devices
+```
+
+Ответ:
+```json
+{
+  "devices": [
+    {
+      "device_id": "pikvm-server1",
+      "host": "192.168.1.100",
+      "enabled": true
+    },
+    {
+      "device_id": "pikvm-server2",
+      "host": "192.168.1.101",
+      "enabled": true
+    }
+  ],
+  "count": 2
+}
+```
+
 ### Системная информация
 
 ```http
+# Для конкретного устройства
+GET /api/plugins/pikvm_client/info?device_id=pikvm-server1&fields=version,hostname
+
+# Если устройство одно, device_id можно не указывать
 GET /api/plugins/pikvm_client/info?fields=version,hostname
 ```
 
@@ -73,13 +131,14 @@ GET /api/plugins/pikvm_client/info?fields=version,hostname
 
 ```http
 # Получить состояние питания
-GET /api/plugins/pikvm_client/power
+GET /api/plugins/pikvm_client/power?device_id=pikvm-server1
 
 # Управление питанием
 POST /api/plugins/pikvm_client/power
 Content-Type: application/json
 
 {
+  "device_id": "pikvm-server1",  # обязательно, если устройств несколько
   "action": "on",  # on, off, off_hard, reset_hard
   "wait": false
 }
@@ -89,6 +148,7 @@ POST /api/plugins/pikvm_client/power/click
 Content-Type: application/json
 
 {
+  "device_id": "pikvm-server1",  # обязательно, если устройств несколько
   "button": "power",  # power, power_long, reset
   "wait": false
 }
@@ -98,13 +158,14 @@ Content-Type: application/json
 
 ```http
 # Получить состояние GPIO
-GET /api/plugins/pikvm_client/gpio
+GET /api/plugins/pikvm_client/gpio?device_id=pikvm-server1
 
 # Переключить GPIO канал
 POST /api/plugins/pikvm_client/gpio/switch
 Content-Type: application/json
 
 {
+  "device_id": "pikvm-server1",  # обязательно, если устройств несколько
   "channel": 1,
   "state": 1,  # 0 или 1
   "wait": false
@@ -115,6 +176,7 @@ POST /api/plugins/pikvm_client/gpio/pulse
 Content-Type: application/json
 
 {
+  "device_id": "pikvm-server1",  # обязательно, если устройств несколько
   "channel": 1,
   "delay": 1.0,  # Длительность импульса в секундах
   "wait": false
@@ -125,35 +187,59 @@ Content-Type: application/json
 
 ```http
 # Получить состояние MSD
-GET /api/plugins/pikvm_client/msd
+GET /api/plugins/pikvm_client/msd?device_id=pikvm-server1
 ```
 
 ### Логи системы
 
 ```http
-GET /api/plugins/pikvm_client/logs?follow=false&seek=3600
+GET /api/plugins/pikvm_client/logs?device_id=pikvm-server1&follow=false&seek=3600
 ```
 
 ### Проверка здоровья
 
 ```http
+# Проверка всех устройств
 GET /api/plugins/pikvm_client/health
+
+# Проверка конкретного устройства
+GET /api/plugins/pikvm_client/health?device_id=pikvm-server1
 ```
 
-Ответ:
+Ответ (для всех устройств):
 ```json
 {
   "status": "healthy",
+  "configured": true,
+  "devices": {
+    "pikvm-server1": {
+      "status": "healthy",
+      "http_connection": true,
+      "websocket_active": true
+    },
+    "pikvm-server2": {
+      "status": "healthy",
+      "http_connection": true,
+      "websocket_active": true
+    }
+  }
+}
+```
+
+Ответ (для одного устройства):
+```json
+{
+  "status": "healthy",
+  "device_id": "pikvm-server1",
+  "configured": true,
   "http_connection": true,
-  "websocket_active": true,
-  "grpc_active": true,
-  "mongodb_connected": true
+  "websocket_active": true
 }
 ```
 
 ## Использование через Actions
 
-Плагин поддерживает действия (actions) для интеграции с другими компонентами системы:
+Плагин поддерживает действия (actions) для интеграции с другими компонентами системы. **Важно:** `device_id` теперь обязателен, если настроено несколько устройств.
 
 ### Включить питание
 
@@ -161,7 +247,7 @@ GET /api/plugins/pikvm_client/health
 {
   "action": "pikvm.power.on",
   "payload": {
-    "device_id": "pikvm-1",
+    "device_id": "pikvm-server1",  # обязательно
     "wait": false
   }
 }
@@ -173,7 +259,7 @@ GET /api/plugins/pikvm_client/health
 {
   "action": "pikvm.power.off",
   "payload": {
-    "device_id": "pikvm-1",
+    "device_id": "pikvm-server1",  # обязательно
     "wait": false
   }
 }
@@ -185,7 +271,7 @@ GET /api/plugins/pikvm_client/health
 {
   "action": "pikvm.gpio.switch",
   "payload": {
-    "device_id": "pikvm-1",
+    "device_id": "pikvm-server1",  # обязательно
     "channel": 1,
     "state": 1,
     "wait": false
@@ -195,12 +281,43 @@ GET /api/plugins/pikvm_client/health
 
 ## WebSocket мониторинг
 
-Плагин автоматически подключается к WebSocket API PiKVM и сохраняет события в MongoDB (если настроено). События включают:
+Плагин автоматически подключается к WebSocket API каждого настроенного устройства PiKVM. Все события:
 
-- Состояние системы
-- Изменения питания
-- GPIO события
-- Ошибки соединения
+1. **Логируются** через стандартный Python logging с префиксом `[device_id]` (автономная работа)
+2. **Публикуются** в Event Bus Home Console (если доступен) для интеграции с другими плагинами
+
+### События WebSocket
+
+- `websocket.connected` - соединение установлено
+- `websocket.closed` - соединение закрыто
+- `websocket.error` - ошибка соединения
+- `websocket.message` - получено сообщение
+- `websocket.status` - обновление статуса
+
+### События действий
+
+- `power.controlled` - управление питанием
+- `power.button_clicked` - нажатие кнопки питания
+- `gpio.switched` - переключение GPIO
+- `gpio.pulsed` - импульс GPIO
+
+Все события содержат `device_id` для идентификации устройства.
+
+### Интеграция с другими плагинами
+
+Другие плагины могут подписаться на события PiKVM:
+
+```python
+async def on_pikvm_event(event_name: str, data: dict):
+    print(f"PiKVM event: {event_name}, device: {data['device_id']}")
+
+# Подписка на все события PiKVM
+await event_bus.subscribe("pikvm_client.*", on_pikvm_event)
+
+# Подписка на конкретные события
+await event_bus.subscribe("pikvm_client.power.*", on_pikvm_event)
+await event_bus.subscribe("pikvm_client.websocket.*", on_pikvm_event)
+```
 
 ## Структура плагина
 

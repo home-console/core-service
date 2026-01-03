@@ -8,7 +8,7 @@ import os
 from typing import Dict, Any
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, HTTPException, Request, Query, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from typing import Optional
@@ -18,6 +18,9 @@ from ..models import Plugin, PluginVersion, PluginInstallJob
 from ..utils.http_client import _http_json
 from ..utils.auth import generate_jwt_token
 from ..plugin_system.registry import external_plugin_registry
+from ..dependencies import get_plugin_loader, get_event_bus
+from ..plugin_system.loader import PluginLoader
+from ..event_bus import EventBus
 
 import logging
 import uuid
@@ -36,15 +39,15 @@ def standard_response(status: str = "ok", data: Optional[dict] = None, message: 
 
 
 @router.get("/plugins")
-async def list_plugins(request: Request):
+async def list_plugins(
+    plugin_loader: Optional[PluginLoader] = Depends(get_plugin_loader)
+):
     """List all plugins from registry and loaded plugins."""
-    app = request.app
     result = {}
     
     # Получаем множество загруженных плагинов для проверки статуса
     loaded_plugin_ids = set()
-    if hasattr(app.state, 'plugin_loader'):
-        plugin_loader = app.state.plugin_loader
+    if plugin_loader:
         loaded_plugin_ids = set(plugin_loader.plugins.keys())
         
         # Добавляем загруженные плагины из plugin_loader
@@ -113,18 +116,18 @@ async def list_plugins(request: Request):
 
 
 @router.get("/plugins/status")
-async def get_plugins_status(request: Request):
+async def get_plugins_status(
+    plugin_loader: Optional[PluginLoader] = Depends(get_plugin_loader)
+):
     """Get status of all plugins."""
-    app = request.app
     status = {'internal': {}, 'external': {}}
     
     try:
-        if hasattr(app.state, 'plugin_loader'):
-            pl = app.state.plugin_loader
-            for pid, p in pl.plugins.items():
+        if plugin_loader:
+            for pid, p in plugin_loader.plugins.items():
                 status['internal'][pid] = {'name': getattr(p, 'name', pid), 'loaded': True}
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get plugin status: {e}", exc_info=True)
 
     for pid, plugin in external_plugin_registry.plugins.items():
         status['external'][pid] = {
@@ -137,14 +140,15 @@ async def get_plugins_status(request: Request):
 
 
 @router.post("/plugins/{plugin_id}/health-check")
-async def check_plugin_health(plugin_id: str, request: Request):
+async def check_plugin_health(
+    plugin_id: str,
+    plugin_loader: Optional[PluginLoader] = Depends(get_plugin_loader)
+):
     """Check health of specific plugin."""
     # Сначала смотрим встроенные (in-process) плагины
-    if hasattr(request.app.state, 'plugin_loader'):
-        pl = request.app.state.plugin_loader
-        if plugin_id in pl.plugins:
-            # Встроенный плагин считаем healthy, если он загружен
-            return standard_response(data={'plugin_id': plugin_id, 'healthy': True, 'type': 'internal'})
+    if plugin_loader and plugin_id in plugin_loader.plugins:
+        # Встроенный плагин считаем healthy, если он загружен
+        return standard_response(data={'plugin_id': plugin_id, 'healthy': True, 'type': 'internal'})
     # Затем внешний реестр
     ok = await external_plugin_registry.health_check(plugin_id)
     plugin = external_plugin_registry.get_plugin(plugin_id)
@@ -155,14 +159,15 @@ async def check_plugin_health(plugin_id: str, request: Request):
 
 
 @router.post("/plugins/health-check-all")
-async def check_all_plugins_health(request: Request):
+async def check_all_plugins_health(
+    plugin_loader: Optional[PluginLoader] = Depends(get_plugin_loader)
+):
     """Check health of all plugins."""
     results: Dict[str, Any] = {}
     
     # Встроенные плагины: помечаем healthy=True если загружены
-    if hasattr(request.app.state, 'plugin_loader'):
-        pl = request.app.state.plugin_loader
-        for pid in pl.plugins.keys():
+    if plugin_loader:
+        for pid in plugin_loader.plugins.keys():
             results[pid] = True
     
     # Внешние плагины: проверяем через registry
@@ -173,14 +178,11 @@ async def check_all_plugins_health(request: Request):
 
 
 @router.post("/plugins/install")
-async def install_plugin(payload: Dict[str, Any], request: Request):
+async def install_plugin(
+    payload: Dict[str, Any],
+    plugin_loader: PluginLoader = Depends(get_plugin_loader)
+):
     """Install plugin from various sources (URL, git, file upload)."""
-    app = request.app
-    
-    if not hasattr(app.state, 'plugin_loader'):
-        raise HTTPException(status_code=503, detail='Plugin loader not available')
-    
-    plugin_loader = app.state.plugin_loader
     install_type = (payload or {}).get('type', 'url')  # url, git, local
     
     # Create PluginInstallJob and run installation in background
@@ -365,8 +367,8 @@ async def retry_install_job(job_id: str):
 
 @router.delete("/plugins/{plugin_id}")
 async def uninstall_plugin(
-    plugin_id: str, 
-    request: Request,
+    plugin_id: str,
+    plugin_loader: PluginLoader = Depends(get_plugin_loader),
     drop_tables: bool = Query(False, description="Удалить таблицы плагина из БД (ОПАСНО - удаляет данные!)")
 ):
     """
@@ -376,12 +378,6 @@ async def uninstall_plugin(
         plugin_id: ID плагина для удаления
         drop_tables: Если True, удаляет таблицы плагина из БД (ОПАСНО - удаляет данные!)
     """
-    app = request.app
-    
-    if not hasattr(app.state, 'plugin_loader'):
-        raise HTTPException(status_code=503, detail='Plugin loader not available')
-    
-    plugin_loader = app.state.plugin_loader
     
     try:
         # First unload if loaded
@@ -397,7 +393,11 @@ async def uninstall_plugin(
 
 
 @router.post("/plugins/{plugin_id}/enable", tags=["plugins"])
-async def enable_plugin(plugin_id: str, request: Request):
+async def enable_plugin(
+    plugin_id: str,
+    plugin_loader: PluginLoader = Depends(get_plugin_loader),
+    request: Request = None
+):
     """
     Enable (load) a plugin.
 
@@ -410,12 +410,6 @@ async def enable_plugin(plugin_id: str, request: Request):
     Returns:
         JSON response with plugin_id and status message
     """
-    app = request.app
-
-    if not hasattr(app.state, 'plugin_loader'):
-        raise HTTPException(status_code=503, detail='Plugin loader not available')
-
-    plugin_loader = app.state.plugin_loader
 
     # Для инфраструктурных плагинов (например, client_manager) разрешаем только перезагрузку
     is_infrastructure_plugin = plugin_id == "client_manager"
@@ -456,7 +450,7 @@ async def enable_plugin(plugin_id: str, request: Request):
             await plugin_loader.reload_plugin(plugin_id)
 
         # Force OpenAPI regeneration
-        if hasattr(request.app, 'openapi_schema'):
+        if request and hasattr(request.app, 'openapi_schema'):
             request.app.openapi_schema = None
 
         return standard_response(data={'plugin_id': plugin_id}, message='enabled')
@@ -466,7 +460,10 @@ async def enable_plugin(plugin_id: str, request: Request):
 
 
 @router.post("/plugins/{plugin_id}/disable", tags=["plugins"])
-async def disable_plugin(plugin_id: str, request: Request):
+async def disable_plugin(
+    plugin_id: str,
+    plugin_loader: PluginLoader = Depends(get_plugin_loader)
+):
     """
     Disable (unload) a plugin without removing it.
 
@@ -479,12 +476,6 @@ async def disable_plugin(plugin_id: str, request: Request):
     Returns:
         JSON response with plugin_id and status message
     """
-    app = request.app
-
-    if not hasattr(app.state, 'plugin_loader'):
-        raise HTTPException(status_code=503, detail='Plugin loader not available')
-
-    plugin_loader = app.state.plugin_loader
 
     # Для инфраструктурных плагинов (например, client_manager) запрещаем выгрузку
     is_infrastructure_plugin = plugin_id == "client_manager"
@@ -523,7 +514,11 @@ async def disable_plugin(plugin_id: str, request: Request):
 
 
 @router.post("/plugins/{plugin_id}/reload", tags=["plugins"])
-async def reload_plugin(plugin_id: str, request: Request):
+async def reload_plugin(
+    plugin_id: str,
+    plugin_loader: PluginLoader = Depends(get_plugin_loader),
+    request: Request = None
+):
     """
     Reload a plugin (unload and load again).
 
@@ -536,12 +531,6 @@ async def reload_plugin(plugin_id: str, request: Request):
     Returns:
         JSON response with plugin_id and status message
     """
-    app = request.app
-
-    if not hasattr(app.state, 'plugin_loader'):
-        raise HTTPException(status_code=503, detail='Plugin loader not available')
-
-    plugin_loader = app.state.plugin_loader
 
     # Для инфраструктурных плагинов используем специфичную логику
     is_infrastructure_plugin = plugin_id == "client_manager"
@@ -553,9 +542,9 @@ async def reload_plugin(plugin_id: str, request: Request):
                 # Для инфраструктурных плагинов может потребоваться специальная обработка
                 # Сохраняем текущий режим и восстанавливаем после перезагрузки
                 current_mode = "unknown"
-                if hasattr(app.state, 'plugin_mode_manager'):
+                if request and hasattr(request.app.state, 'plugin_mode_manager'):
                     try:
-                        mode_manager = app.state.plugin_mode_manager
+                        mode_manager = request.app.state.plugin_mode_manager
                         mode_info = await mode_manager.get_mode_status(plugin_id)
                         current_mode = mode_info.get('current_mode', 'in_process')
                     except Exception:
@@ -567,9 +556,9 @@ async def reload_plugin(plugin_id: str, request: Request):
                 await plugin_loader.reload_plugin(plugin_id)
 
                 # Если доступен PluginModeManager, восстанавливаем режим
-                if hasattr(app.state, 'plugin_mode_manager') and current_mode != "unknown":
+                if request and hasattr(request.app.state, 'plugin_mode_manager') and current_mode != "unknown":
                     try:
-                        mode_manager = app.state.plugin_mode_manager
+                        mode_manager = request.app.state.plugin_mode_manager
                         from ..plugin_system.managers import PluginMode
                         target_mode = PluginMode(current_mode)
                         # Переключаем в тот же режим для инициализации
@@ -584,7 +573,7 @@ async def reload_plugin(plugin_id: str, request: Request):
             await plugin_loader.reload_plugin(plugin_id)
 
         # Force OpenAPI regeneration
-        if hasattr(request.app, 'openapi_schema'):
+        if request and hasattr(request.app, 'openapi_schema'):
             request.app.openapi_schema = None
 
         return standard_response(data={'plugin_id': plugin_id}, message='reloaded')
@@ -594,7 +583,11 @@ async def reload_plugin(plugin_id: str, request: Request):
 
 
 @router.post("/plugins/{plugin_id}/activate", tags=["plugins"])
-async def activate_plugin(plugin_id: str, request: Request):
+async def activate_plugin(
+    plugin_id: str,
+    plugin_loader: PluginLoader = Depends(get_plugin_loader),
+    request: Request = None
+):
     """
     Activate a plugin (enable considering current mode).
 
@@ -607,12 +600,6 @@ async def activate_plugin(plugin_id: str, request: Request):
     Returns:
         JSON response with plugin_id and status message
     """
-    app = request.app
-
-    if not hasattr(app.state, 'plugin_loader'):
-        raise HTTPException(status_code=503, detail='Plugin loader not available')
-
-    plugin_loader = app.state.plugin_loader
     is_infrastructure_plugin = plugin_id == "client_manager"
 
     try:
@@ -646,7 +633,7 @@ async def activate_plugin(plugin_id: str, request: Request):
                 await plugin_loader.reload_plugin(plugin_id)
 
         # Force OpenAPI regeneration
-        if hasattr(request.app, 'openapi_schema'):
+        if request and hasattr(request.app, 'openapi_schema'):
             request.app.openapi_schema = None
 
         return standard_response(data={'plugin_id': plugin_id}, message='activated')
@@ -656,7 +643,10 @@ async def activate_plugin(plugin_id: str, request: Request):
 
 
 @router.post("/plugins/{plugin_id}/deactivate", tags=["plugins"])
-async def deactivate_plugin(plugin_id: str, request: Request):
+async def deactivate_plugin(
+    plugin_id: str,
+    plugin_loader: PluginLoader = Depends(get_plugin_loader)
+):
     """
     Deactivate a plugin (disable while preserving configuration).
 
@@ -669,12 +659,6 @@ async def deactivate_plugin(plugin_id: str, request: Request):
     Returns:
         JSON response with plugin_id and status message
     """
-    app = request.app
-
-    if not hasattr(app.state, 'plugin_loader'):
-        raise HTTPException(status_code=503, detail='Plugin loader not available')
-
-    plugin_loader = app.state.plugin_loader
     is_infrastructure_plugin = plugin_id == "client_manager"
 
     if is_infrastructure_plugin:
@@ -788,7 +772,12 @@ async def get_plugin_mode(plugin_id: str, request: Request):
 
 
 @router.post("/plugins/{plugin_id}/mode")
-async def set_plugin_mode(plugin_id: str, payload: Dict[str, Any], request: Request):
+async def set_plugin_mode(
+    plugin_id: str,
+    payload: Dict[str, Any],
+    request: Request,
+    plugin_loader: Optional[PluginLoader] = Depends(get_plugin_loader)
+):
     """
     Set runtime mode for a plugin.
 
@@ -883,8 +872,7 @@ async def set_plugin_mode(plugin_id: str, payload: Dict[str, Any], request: Requ
                 os.environ["CM_MODE"] = "embedded"
                 requires_restart = True  # Нужен перезапуск для применения
 
-                if apply_now and hasattr(app.state, 'plugin_loader'):
-                    plugin_loader = app.state.plugin_loader
+                if apply_now and plugin_loader:
                     try:
                         # Перезагружаем плагин для embedded режима
                         if plugin_id in plugin_loader.plugins:
@@ -901,8 +889,7 @@ async def set_plugin_mode(plugin_id: str, payload: Dict[str, Any], request: Requ
 
                 # Для external режима НЕ пытаемся перезагружать плагин как внутренний
                 # Просто отключаем его в памяти, если он загружен
-                if apply_now and hasattr(app.state, 'plugin_loader'):
-                    plugin_loader = app.state.plugin_loader
+                if apply_now and plugin_loader:
                     try:
                         if plugin_id in plugin_loader.plugins:
                             # Выгружаем плагин из памяти, т.к. он теперь работает как внешний сервис
@@ -929,7 +916,10 @@ async def set_plugin_mode(plugin_id: str, payload: Dict[str, Any], request: Requ
 
 
 @router.get("/plugins/modes")
-async def list_plugins_modes(request: Request):
+async def list_plugins_modes(
+    request: Request,
+    plugin_loader: Optional[PluginLoader] = Depends(get_plugin_loader)
+):
     """
     Get runtime modes for all plugins.
 
@@ -945,12 +935,16 @@ async def list_plugins_modes(request: Request):
 
             result = []
             for plugin_id, plugin_status in status.items():
+                is_loaded = plugin_loader and plugin_id in plugin_loader.plugins if plugin_loader else False
+                plugin_obj = plugin_loader.plugins.get(plugin_id) if plugin_loader and plugin_id in plugin_loader.plugins else None
+                is_enabled = getattr(plugin_obj, 'enabled', True) if plugin_obj else True
+                
                 plugin_info = {
                     'id': plugin_id,
                     'name': plugin_status.get('name', plugin_id),
                     'runtime_mode': plugin_status.get('current_mode', 'in_process'),
-                    'loaded': plugin_id in getattr(app.state.plugin_loader, 'plugins', {}),
-                    'enabled': getattr(app.state.plugin_loader.plugins.get(plugin_id), 'enabled', True) if plugin_id in getattr(app.state.plugin_loader, 'plugins', {}) else True,
+                    'loaded': is_loaded,
+                    'enabled': is_enabled,
                     'available_modes': [m.value for m in plugin_status.get('supported_modes', [])] if plugin_status.get('supported_modes') else ['in_process'],
                     'supports_mode_switch': plugin_status.get('mode_switch_supported', False),
                     'process_info': plugin_status.get('process_info', {}),
@@ -987,8 +981,7 @@ async def list_plugins_modes(request: Request):
         logger.warning(f"Could not load plugin modes from DB: {e}")
 
     # Добавляем загруженные плагины, которых нет в БД
-    if hasattr(app.state, 'plugin_loader'):
-        plugin_loader = app.state.plugin_loader
+    if plugin_loader:
         db_ids = {p['id'] for p in result}
 
         for pid, plugin in plugin_loader.plugins.items():
@@ -1359,13 +1352,12 @@ async def registry_get(name: str):
 
 # Internal plugins API
 @router.get("/admin/plugins")
-async def list_admin_plugins(request: Request):
+async def list_admin_plugins(
+    plugin_loader: Optional[PluginLoader] = Depends(get_plugin_loader)
+):
     """List all loaded internal plugins."""
-    app = request.app
-    if not hasattr(app.state, 'plugin_loader'):
+    if not plugin_loader:
         return {"plugins": [], "message": "Plugin loader not initialized"}
-    
-    plugin_loader = app.state.plugin_loader
     result = {}
     runtime_loaded_ids = set()
 
@@ -1557,12 +1549,13 @@ async def plugin_control_status(plugin_id: str):
 
 
 @router.get("/v1/admin/stats")
-async def get_stats(request: Request):
+async def get_stats(
+    plugin_loader: Optional[PluginLoader] = Depends(get_plugin_loader)
+):
     """Get system statistics."""
-    app = request.app
     plugin_count = 0
-    if hasattr(app.state, 'plugin_loader'):
-        plugin_count = len(app.state.plugin_loader.plugins)
+    if plugin_loader:
+        plugin_count = len(plugin_loader.plugins)
     
     return standard_response(data={"status": "running", "plugins_loaded": plugin_count, "version": "2.0.0"})
 

@@ -14,6 +14,12 @@ from pydantic import BaseModel
 from ..db import get_session
 from ..models import Device, PluginBinding, IntentMapping, DeviceLink, User
 from ..routes.auth import get_current_user
+from ..utils.cache import cache_get, cache_set, cache_delete_pattern
+from ..dependencies import get_plugin_loader
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from ..plugin_system.loader import PluginLoader
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -72,17 +78,40 @@ class IntentMappingCreate(BaseModel):
 @router.get("/devices")
 async def list_devices() -> JSONResponse:
     """Get list of all devices with bindings and states."""
+    # Проверяем кэш
+    cache_key = "devices:list:all"
+    cached_result = await cache_get(cache_key)
+    if cached_result is not None:
+        return JSONResponse(cached_result)
+    
     async with get_session() as db:
+        # Оптимизация: загружаем устройства и привязки одним запросом через JOIN
+        from sqlalchemy.orm import selectinload
+        
+        # Загружаем все устройства
         result = await db.execute(select(Device))
         devices = result.scalars().all()
         
+        # Загружаем все привязки одним запросом (batch loading)
+        device_ids = [d.id for d in devices]
+        if device_ids:
+            bindings_result = await db.execute(
+                select(PluginBinding).where(PluginBinding.device_id.in_(device_ids))
+            )
+            all_bindings = bindings_result.scalars().all()
+            # Группируем привязки по device_id
+            bindings_by_device = {}
+            for b in all_bindings:
+                if b.device_id not in bindings_by_device:
+                    bindings_by_device[b.device_id] = []
+                bindings_by_device[b.device_id].append(b)
+        else:
+            bindings_by_device = {}
+        
         devices_list = []
         for d in devices:
-            # Получаем привязки для устройства
-            bindings_result = await db.execute(
-                select(PluginBinding).where(PluginBinding.device_id == d.id)
-            )
-            bindings = bindings_result.scalars().all()
+            # Получаем привязки из предзагруженного словаря
+            bindings = bindings_by_device.get(d.id, [])
             
             # Извлекаем информацию о состоянии из meta
             state = None
@@ -112,6 +141,9 @@ async def list_devices() -> JSONResponse:
                 "updated_at": d.updated_at.isoformat() if d.updated_at else None
             })
         
+        # Сохраняем в кэш на 30 секунд
+        await cache_set(cache_key, devices_list, ttl=30)
+        
         return JSONResponse(devices_list)
 
 
@@ -139,6 +171,8 @@ async def get_device(device_id: str) -> JSONResponse:
 
 @router.post("/devices")
 async def create_device(device_data: DeviceCreate) -> JSONResponse:
+    # Инвалидируем кэш при создании устройства
+    await cache_delete_pattern("devices:*")
     """Create a new device."""
     import uuid
     device_id = f"dev_{uuid.uuid4().hex[:16]}"
@@ -155,6 +189,9 @@ async def create_device(device_data: DeviceCreate) -> JSONResponse:
         db.add(device)
         await db.flush()
         
+        # Инвалидируем кэш
+        await cache_delete_pattern("devices:*")
+        
         return JSONResponse({
             "id": device.id,
             "name": device.name,
@@ -170,6 +207,8 @@ async def create_device(device_data: DeviceCreate) -> JSONResponse:
 
 @router.put("/devices/{device_id}")
 async def update_device(device_id: str, device_data: DeviceUpdate) -> JSONResponse:
+    # Инвалидируем кэш при обновлении устройства
+    await cache_delete_pattern("devices:*")
     """Update device."""
     async with get_session() as db:
         result = await db.execute(select(Device).where(Device.id == device_id))
@@ -197,6 +236,8 @@ async def update_device(device_id: str, device_data: DeviceUpdate) -> JSONRespon
 
 @router.delete("/devices/{device_id}")
 async def delete_device(device_id: str) -> JSONResponse:
+    # Инвалидируем кэш при удалении устройства
+    await cache_delete_pattern("devices:*")
     """Delete device."""
     async with get_session() as db:
         result = await db.execute(select(Device).where(Device.id == device_id))
@@ -285,10 +326,14 @@ async def _execute_device_action_internal(device_id: str, payload: Dict[str, Any
         
         # Публикуем событие для плагина
         # Плагины должны подписаться на события типа "device.{device_id}.execute"
+        # Используем глобальный event_bus для обратной совместимости
+        # TODO: Рефакторить _execute_device_action_internal для использования DI через параметр
         try:
-            from ..event_bus import event_bus
-        except ImportError:
-            from event_bus import event_bus
+            from ..event_bus import get_event_bus as get_global_event_bus
+            event_bus = get_global_event_bus()
+        except Exception as e:
+            logger.warning(f"Could not get event_bus: {e}")
+            event_bus = None
         
         action = payload.get("action", "execute")
         event_name = f"device.{device_id}.{action}"
@@ -300,7 +345,11 @@ async def _execute_device_action_internal(device_id: str, payload: Dict[str, Any
         }
         logger.info(f"🔔 PUBLISHING EVENT: {event_name}")
         logger.info(f"🔔 EVENT DATA: {event_data}")
-        await event_bus.emit(event_name, event_data)
+        
+        if event_bus:
+            await event_bus.emit(event_name, event_data)
+        else:
+            logger.warning(f"Event bus not available, event {event_name} not published")
         
         return {
             "status": "ok",
@@ -357,6 +406,7 @@ async def sync_all_yandex_devices(
     request: Request,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
+    plugin_loader: Optional['PluginLoader'] = Depends(get_plugin_loader),
     full_sync: bool = Query(False, description="Полная синхронизация (медленнее, но обновляет все данные устройств)")
 ) -> JSONResponse:
     """
@@ -369,12 +419,12 @@ async def sync_all_yandex_devices(
     
     # Получаем плагин Яндекса
     try:
-        app = request.app
-        if hasattr(app.state, 'plugin_loader'):
-            plugin_loader = app.state.plugin_loader
-            yandex_plugin = plugin_loader.plugins.get('yandex_smart_home')
-            
-            if yandex_plugin:
+        if not plugin_loader:
+            raise HTTPException(status_code=503, detail="Plugin loader not available")
+        
+        yandex_plugin = plugin_loader.plugins.get('yandex_smart_home')
+        
+        if yandex_plugin:
                 sync_stats = {
                     'step1_synced_new': 0,
                     'step1_updated': 0,
@@ -450,13 +500,25 @@ async def sync_all_yandex_devices(
                     result = await db.execute(select(Device))
                     devices = result.scalars().all()
                     
+                    # Оптимизация: загружаем все привязки одним запросом
+                    device_ids = [d.id for d in devices]
+                    if device_ids:
+                        bindings_result = await db.execute(
+                            select(PluginBinding).where(PluginBinding.device_id.in_(device_ids))
+                        )
+                        all_bindings = bindings_result.scalars().all()
+                        bindings_by_device = {}
+                        for b in all_bindings:
+                            if b.device_id not in bindings_by_device:
+                                bindings_by_device[b.device_id] = []
+                            bindings_by_device[b.device_id].append(b)
+                    else:
+                        bindings_by_device = {}
+                    
                     devices_list = []
                     for d in devices:
-                        # Получаем привязки для устройства
-                        bindings_result = await db.execute(
-                            select(PluginBinding).where(PluginBinding.device_id == d.id)
-                        )
-                        bindings = bindings_result.scalars().all()
+                        # Получаем привязки из предзагруженного словаря
+                        bindings = bindings_by_device.get(d.id, [])
                         
                         # Проверяем, что это устройство Яндекса
                         has_yandex_binding = any(b.plugin_name == 'yandex_smart_home' for b in bindings)
@@ -501,10 +563,8 @@ async def sync_all_yandex_devices(
                         },
                         "devices": devices_list
                     })
-            else:
-                raise HTTPException(status_code=500, detail="Yandex Smart Home plugin not loaded")
         else:
-            raise HTTPException(status_code=500, detail="Plugin loader not available")
+            raise HTTPException(status_code=500, detail="Yandex Smart Home plugin not loaded")
     except HTTPException:
         raise
     except Exception as e:
@@ -516,7 +576,8 @@ async def sync_all_yandex_devices(
 async def sync_single_yandex_device(
     device_id: str,
     request: Request,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    plugin_loader: Optional['PluginLoader'] = Depends(get_plugin_loader)
 ) -> JSONResponse:
     """
     Синхронизировать одно конкретное устройство Яндекса.
@@ -526,11 +587,9 @@ async def sync_single_yandex_device(
     logger.info(f"Syncing single Yandex device {device_id} for user: {user_id}")
     
     try:
-        app = request.app
-        if not hasattr(app.state, 'plugin_loader'):
-            raise HTTPException(status_code=500, detail="Plugin loader not available")
+        if not plugin_loader:
+            raise HTTPException(status_code=503, detail="Plugin loader not available")
         
-        plugin_loader = app.state.plugin_loader
         yandex_plugin = plugin_loader.plugins.get('yandex_smart_home')
         
         if not yandex_plugin:

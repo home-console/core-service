@@ -4,8 +4,8 @@ Event Bus для коммуникации между плагинами.
 """
 
 from typing import Dict, List, Callable, Any, Optional
-from datetime import datetime
-from collections import deque
+from datetime import datetime, timedelta
+from collections import deque, defaultdict
 import asyncio
 import logging
 
@@ -30,12 +30,13 @@ class EventLogEntry:
 
 class EventBus:
     """
-    Простой in-process Event Bus для коммуникации между плагинами.
+    Оптимизированный in-process Event Bus для коммуникации между плагинами.
     
-    Поддерживает подписку на события с использованием wildcard-паттернов:
-    - "device.*" - все события, начинающиеся с "device."
-    - "*" - все события
-    - "device.state_changed" - точное совпадение
+    Поддерживает:
+    - Подписку на события с использованием wildcard-паттернов
+    - Debouncing для частых событий
+    - Batch обработку событий
+    - Асинхронную очередь для обработки
     
     Пример использования:
     
@@ -55,32 +56,91 @@ class EventBus:
     ```
     """
     
-    def __init__(self, max_log_size: int = 1000):
+    def __init__(self, max_log_size: int = 1000, debounce_ms: int = 100, batch_size: int = 10):
         """
         Инициализация Event Bus.
         
         Args:
             max_log_size: Максимальное количество записей в логе событий
+            debounce_ms: Время debounce в миллисекундах (для одинаковых событий)
+            batch_size: Размер батча для batch обработки
         """
         self.subscribers: Dict[str, List[Callable]] = {}
         self.event_log: deque = deque(maxlen=max_log_size)
         self.stats: Dict[str, int] = {
             "total_events": 0,
-            "events_by_type": {}
+            "events_by_type": {},
+            "debounced_events": 0,
+            "batched_events": 0
         }
+        
+        # Оптимизация: debouncing для частых событий
+        self.debounce_ms = debounce_ms
+        self.debounce_timers: Dict[str, asyncio.Task] = {}
+        self.pending_events: Dict[str, Dict[str, Any]] = {}
+        
+        # Оптимизация: batch обработка
+        self.batch_size = batch_size
+        self.event_queue: asyncio.Queue = asyncio.Queue()
+        self.batch_processor_task: Optional[asyncio.Task] = None
+        
+        # Запускаем batch processor
+        self._start_batch_processor()
     
-    async def emit(self, event_name: str, data: Dict[str, Any]):
-        """
-        Опубликовать событие всем подписчикам.
+    def _start_batch_processor(self):
+        """Запустить фоновую задачу для batch обработки событий."""
+        async def process_batch():
+            batch = []
+            while True:
+                try:
+                    # Собираем события в батч
+                    event = await asyncio.wait_for(self.event_queue.get(), timeout=0.1)
+                    batch.append(event)
+                    
+                    # Если батч заполнен или прошло время, обрабатываем
+                    if len(batch) >= self.batch_size:
+                        await self._process_batch(batch)
+                        batch = []
+                except asyncio.TimeoutError:
+                    # Таймаут - обрабатываем накопленный батч
+                    if batch:
+                        await self._process_batch(batch)
+                        batch = []
+                except Exception as e:
+                    logger.error(f"Error in batch processor: {e}", exc_info=True)
         
-        Args:
-            event_name: Имя события (например: "device.state_changed")
-            data: Данные события (словарь)
-        """
-        logger.info(f"📢 EVENT EMIT: {event_name}")
-        logger.debug(f"📢 EVENT DATA: {data}")
-        logger.debug(f"📢 SUBSCRIBERS: {list(self.subscribers.keys())}")
+        self.batch_processor_task = asyncio.create_task(process_batch())
+    
+    async def _process_batch(self, batch: List[tuple]):
+        """Обработать батч событий."""
+        # Обрабатываем события параллельно
+        tasks = []
+        for event_name, data in batch:
+            # Найти всех подписчиков с совпадающими паттернами
+            for pattern, handlers in self.subscribers.items():
+                if self._match_pattern(event_name, pattern):
+                    for handler in handlers:
+                        tasks.append(self._safe_call_handler(handler, event_name, data))
         
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self.stats["batched_events"] += len(batch)
+    
+    async def _safe_call_handler(self, handler: Callable, event_name: str, data: Dict[str, Any]):
+        """Безопасный вызов обработчика события."""
+        try:
+            if asyncio.iscoroutinefunction(handler):
+                await handler(event_name, data)
+            else:
+                handler(event_name, data)
+        except Exception as e:
+            logger.error(
+                f"❌ Error in event handler for '{event_name}': {e}",
+                exc_info=True
+            )
+    
+    async def _debounced_emit(self, event_name: str, data: Dict[str, Any]):
+        """Внутренний метод для обработки события после debounce."""
         # Сохранить в лог
         log_entry = EventLogEntry(event_name, data)
         self.event_log.append(log_entry)
@@ -89,20 +149,43 @@ class EventBus:
         self.stats["total_events"] += 1
         self.stats["events_by_type"][event_name] = self.stats["events_by_type"].get(event_name, 0) + 1
         
-        # Найти всех подписчиков с совпадающими паттернами
-        for pattern, handlers in self.subscribers.items():
-            if self._match_pattern(event_name, pattern):
-                for handler in handlers:
-                    try:
-                        if asyncio.iscoroutinefunction(handler):
-                            await handler(event_name, data)
-                        else:
-                            handler(event_name, data)
-                    except Exception as e:
-                        logger.error(
-                            f"❌ Error in event handler for '{event_name}' (pattern '{pattern}'): {e}",
-                            exc_info=True
-                        )
+        # Добавляем в очередь для batch обработки
+        await self.event_queue.put((event_name, data))
+    
+    async def emit(self, event_name: str, data: Dict[str, Any], debounce: bool = True):
+        """
+        Опубликовать событие всем подписчикам.
+        
+        Args:
+            event_name: Имя события (например: "device.state_changed")
+            data: Данные события (словарь)
+            debounce: Использовать ли debouncing (по умолчанию True)
+        """
+        logger.debug(f"📢 EVENT EMIT: {event_name}")
+        
+        if not debounce:
+            # Немедленная обработка без debounce
+            await self._debounced_emit(event_name, data)
+            return
+        
+        # Debouncing: отменяем предыдущий таймер для этого события
+        if event_name in self.debounce_timers:
+            self.debounce_timers[event_name].cancel()
+        
+        # Сохраняем последние данные события
+        self.pending_events[event_name] = data
+        
+        # Создаем новый таймер
+        async def delayed_emit():
+            await asyncio.sleep(self.debounce_ms / 1000.0)
+            if event_name in self.pending_events:
+                await self._debounced_emit(event_name, self.pending_events[event_name])
+                del self.pending_events[event_name]
+                if event_name in self.debounce_timers:
+                    del self.debounce_timers[event_name]
+                self.stats["debounced_events"] += 1
+        
+        self.debounce_timers[event_name] = asyncio.create_task(delayed_emit())
     
     def get_logs(self, limit: int = 100, event_filter: Optional[str] = None) -> List[Dict[str, Any]]:
         """
@@ -197,5 +280,23 @@ class EventBus:
         return bool(re.match(regex_pattern, event_name))
 
 
-# Глобальный singleton
-event_bus = EventBus()
+# Глобальный singleton удален - создавать через lifespan в app.py
+# Для обратной совместимости со старым кодом (deprecated)
+_event_bus_instance: Optional[EventBus] = None
+
+def get_event_bus() -> EventBus:
+    """
+    Получить глобальный экземпляр event_bus (deprecated).
+    
+    ВНИМАНИЕ: Используйте только для обратной совместимости.
+    В новом коде передавайте event_bus через DI или app.state.
+    """
+    global _event_bus_instance
+    if _event_bus_instance is None:
+        logger.warning("Creating global event_bus instance (deprecated - use DI instead)")
+        _event_bus_instance = EventBus()
+    return _event_bus_instance
+
+# Для обратной совместимости (deprecated)
+# Используйте app.state.event_bus или Depends вместо этого
+event_bus = get_event_bus()

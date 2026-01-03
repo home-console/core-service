@@ -6,7 +6,8 @@ import pyotp
 import websocket
 import urllib3
 
-from settings import PikvmSettings
+from settings import PikvmSettings, PikvmDeviceConfig
+from typing import Union
 
 # Suppress only the specific InsecureRequestWarning
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -15,19 +16,54 @@ class PikvmController:
     """
     Controller for interacting with PI-KVM API via HTTP and WebSocket
     """
-    def __init__(self, settings: PikvmSettings):
+    def __init__(self, config: Union[PikvmSettings, PikvmDeviceConfig], device_id: str = None):
         """
         Initialize PikvmController with connection settings
         
-        :param settings: PikvmSettings instance (required)
+        :param config: PikvmSettings или PikvmDeviceConfig instance (required)
+        :param device_id: Идентификатор устройства (для логирования)
         """
-        if settings is None:
-            raise ValueError("PikvmSettings instance is required")
+        if config is None:
+            raise ValueError("Configuration instance is required")
         
-        self.settings = settings
+        # Сохраняем исходную конфигурацию
+        self.config = config
+        self.device_id = device_id or getattr(config, 'device_id', 'default')
         
-        # Validate settings
-        self.settings.validate()
+        # Извлекаем параметры подключения
+        if isinstance(config, PikvmDeviceConfig):
+            self.host = config.host
+            self.username = config.username
+            self.password = config.password
+            self.secret = config.secret
+        elif isinstance(config, PikvmSettings):
+            # Обратная совместимость
+            self.host = config.host
+            self.username = config.username
+            self.password = config.password
+            self.secret = config.secret
+            # Validate settings для старого формата
+            if self.host:
+                config.validate()
+        else:
+            raise ValueError("Config must be PikvmSettings or PikvmDeviceConfig")
+        
+        if not self.host:
+            raise ValueError("Host is required")
+        
+        # Создаем объект settings для совместимости с существующим кодом
+        self.settings = type('Settings', (), {
+            'host': self.host,
+            'username': self.username,
+            'password': self.password,
+            'secret': self.secret,
+            'base_url': f"https://{self.host}",
+            'websocket_url': f"wss://{self.host}/api/ws?stream=0",
+            'ssl_options': {
+                "cert_reqs": ssl.CERT_NONE,
+                "check_hostname": False
+            }
+        })()
         
         # Prepare authentication headers
         self.headers = self._prepare_headers()
@@ -39,17 +75,17 @@ class PikvmController:
         :return: Dictionary of authentication headers
         """
         # If TOTP secret is provided, combine password with current TOTP
-        if self.settings.secret:
-            totp_password = self.settings.password + pyotp.TOTP(self.settings.secret).now()
+        if self.secret:
+            totp_password = self.password + pyotp.TOTP(self.secret).now()
             return {
-                "X-KVMD-User": self.settings.username,
+                "X-KVMD-User": self.username,
                 "X-KVMD-Passwd": totp_password,
             }
         
         # Standard authentication
         return {
-            "X-KVMD-User": self.settings.username,
-            "X-KVMD-Passwd": self.settings.password,
+            "X-KVMD-User": self.username,
+            "X-KVMD-Passwd": self.password,
         }
 
     def test_http_connect(self):

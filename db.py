@@ -28,12 +28,24 @@ elif DB_URL.startswith("postgresql+psycopg2://"):
 else:
     async_db_url = DB_URL
 
-# Создаем async engine
+# Создаем async engine с оптимизацией connection pooling
+# Оптимизация: увеличиваем pool size для лучшей производительности
+pool_kwargs = {}
+if not async_db_url.startswith("sqlite"):
+    # Для PostgreSQL и других БД настраиваем connection pool
+    pool_kwargs = {
+        "pool_size": 20,  # Размер пула соединений
+        "max_overflow": 10,  # Дополнительные соединения при перегрузке
+        "pool_pre_ping": True,  # Проверка соединений перед использованием
+        "pool_recycle": 3600,  # Переиспользование соединений каждый час
+    }
+
 engine = create_async_engine(
     async_db_url,
     echo=False,
     future=True,
     connect_args={"check_same_thread": False} if async_db_url.startswith("sqlite") else {},
+    **pool_kwargs
 )
 
 # Создаем async session factory

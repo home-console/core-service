@@ -1,52 +1,55 @@
 import os
 import ssl
 import logging
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from dotenv import load_dotenv
 
 load_dotenv()
 
+class PikvmDeviceConfig(BaseModel):
+    """
+    Конфигурация одного устройства PiKVM
+    """
+    device_id: str = Field(description="Уникальный идентификатор устройства")
+    host: str = Field(description="PI-KVM host address")
+    username: str = Field(default='admin', description="PI-KVM username")
+    password: str = Field(description="PI-KVM password")
+    secret: Optional[str] = Field(default=None, description="Optional TOTP secret key")
+    enabled: bool = Field(default=True, description="Включено ли устройство")
+
 class PikvmSettings(BaseModel):
     """
-    Configuration settings for PI-KVM connection and MongoDB
+    Configuration settings for PI-KVM connection
     """
-    # Connection settings
+    # Connection settings (для обратной совместимости)
     host: Optional[str] = Field(
         default=os.getenv('PIKVM_HOST'), 
-        description="PI-KVM host address"
+        description="PI-KVM host address (deprecated, use devices)"
     )
     username: str = Field(
         default=os.getenv('PIKVM_USERNAME', 'admin'), 
-        description="PI-KVM username"
+        description="PI-KVM username (deprecated, use devices)"
     )
     password: str = Field(
         default=os.getenv('PIKVM_PASSWORD', 'admin'), 
-        description="PI-KVM password"
+        description="PI-KVM password (deprecated, use devices)"
     )
     secret: Optional[str] = Field(
         default=os.getenv('PIKVM_SECRET'), 
-        description="Optional secret key"
+        description="Optional secret key (deprecated, use devices)"
+    )
+    
+    # Новые настройки для множественных устройств
+    devices: List[PikvmDeviceConfig] = Field(
+        default_factory=list,
+        description="Список устройств PiKVM"
     )
 
     # gRPC settings
     grpc_port: int = Field(
         default=int(os.getenv('GRPC_PORT', '50051')), 
         description="gRPC server port"
-    )
-
-    # MongoDB settings
-    mongodb_uri: str = Field(
-        default=os.getenv('MONGODB_URI', 'mongodb://localhost:27017/'), 
-        description="MongoDB connection URI"
-    )
-    mongodb_database: str = Field(
-        default=os.getenv('MONGODB_DATABASE', 'pikvm_data'), 
-        description="MongoDB database name"
-    )
-    mongodb_collection: str = Field(
-        default=os.getenv('MONGODB_COLLECTION', 'websocket_events'), 
-        description="MongoDB collection name"
     )
 
     # Logging settings
@@ -93,17 +96,67 @@ class PikvmSettings(BaseModel):
         Валидация выполняется только если все обязательные поля заданы.
         Это позволяет плагину загрузиться даже без настроек (для последующей настройки через UI).
         """
-        # Валидация выполняется только если host задан (значит пользователь начал настройку)
-        # Если host не задан, просто пропускаем валидацию - плагин загрузится, но не будет работать
-        if self.host:
+        # Если есть устройства в списке, валидируем их
+        if self.devices:
+            device_ids = [d.device_id for d in self.devices]
+            if len(device_ids) != len(set(device_ids)):
+                raise ValueError("Device IDs must be unique")
+            for device in self.devices:
+                if not device.host:
+                    raise ValueError(f"Host must be set for device {device.device_id}")
+                if not device.password:
+                    raise ValueError(f"Password must be set for device {device.device_id}")
+        # Для обратной совместимости: валидация старого формата
+        elif self.host:
             if not self.username:
                 raise ValueError("PIKVM_USERNAME must be set")
             if not self.password:
                 raise ValueError("PIKVM_PASSWORD must be set")
-            if not self.mongodb_uri:
-                raise ValueError("MONGODB_URI must be set")
         
         return self
+    
+    def get_device_config(self, device_id: Optional[str] = None) -> Optional[PikvmDeviceConfig]:
+        """
+        Получить конфигурацию устройства по device_id.
+        Если device_id не указан и есть только одно устройство, вернуть его.
+        Если device_id не указан и используется старый формат (host), создать временную конфигурацию.
+        """
+        if self.devices:
+            if device_id:
+                for device in self.devices:
+                    if device.device_id == device_id and device.enabled:
+                        return device
+                return None
+            elif len(self.devices) == 1:
+                return self.devices[0] if self.devices[0].enabled else None
+            else:
+                return None
+        # Обратная совместимость: если используется старый формат
+        elif self.host:
+            return PikvmDeviceConfig(
+                device_id=device_id or "default",
+                host=self.host,
+                username=self.username,
+                password=self.password,
+                secret=self.secret,
+                enabled=True
+            )
+        return None
+    
+    def get_all_devices(self) -> List[PikvmDeviceConfig]:
+        """Получить список всех включенных устройств"""
+        if self.devices:
+            return [d for d in self.devices if d.enabled]
+        elif self.host:
+            return [PikvmDeviceConfig(
+                device_id="default",
+                host=self.host,
+                username=self.username,
+                password=self.password,
+                secret=self.secret,
+                enabled=True
+            )]
+        return []
 
     def validate(self):
         """

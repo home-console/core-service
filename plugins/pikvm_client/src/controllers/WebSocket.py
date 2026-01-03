@@ -3,14 +3,51 @@ import threading
 import time
 import json
 import logging
+import asyncio
+from typing import Optional, Callable, Any
 
 class PikvmWebSocketClient:
-    def __init__(self, controller, mongodb_handler):
+    def __init__(self, controller, device_id: str = None, event_emitter: Optional[Callable] = None, main_event_loop=None):
+        """
+        Args:
+            controller: PikvmController instance
+            device_id: Идентификатор устройства
+            event_emitter: Async функция для публикации событий (event_name, data)
+            main_event_loop: Event loop из основного потока (для run_coroutine_threadsafe)
+        """
         self.controller = controller
-        self.mongodb_handler = mongodb_handler
+        self.device_id = device_id or getattr(controller, 'device_id', 'unknown')
+        self.event_emitter = event_emitter
+        self.main_event_loop = main_event_loop
         self.ws = None
         self.is_running = False
         self.reconnect_interval = 5  # seconds between reconnection attempts
+    
+    def _emit_event(self, event_name: str, data: dict):
+        """
+        Публиковать событие через event_emitter (если доступен) или просто логировать.
+        Работает автономно - если event_emitter не задан, просто логирует.
+        """
+        event_data = {
+            "device_id": self.device_id,
+            **data
+        }
+        
+        # Логируем всегда (автономная работа)
+        logging.info(f"[{self.device_id}] Event: {event_name}, data: {event_data}")
+        
+        # Публикуем в event bus, если доступен
+        if self.event_emitter and self.main_event_loop:
+            try:
+                # Используем run_coroutine_threadsafe для безопасной публикации из потока
+                future = asyncio.run_coroutine_threadsafe(
+                    self.event_emitter(event_name, event_data),
+                    self.main_event_loop
+                )
+                # Не ждем результата, чтобы не блокировать WebSocket поток
+                # Если нужно, можно добавить обработку исключений через future.exception()
+            except Exception as e:
+                logging.warning(f"Failed to emit event '{event_name}': {e}. Continuing with logging only.")
 
     def on_message(self, ws, message):
         """
@@ -22,12 +59,11 @@ class PikvmWebSocketClient:
         try:
             # Parse the message
             data = json.loads(message)
-            logging.info(f"Received WebSocket message: {data}")
             
-            # Save to MongoDB
-            self.mongodb_handler.save_websocket_event({
-                'source': 'pikvm_websocket',
-                'raw_message': data
+            # Публикуем событие о получении сообщения
+            self._emit_event("websocket.message", {
+                "message": data,
+                "raw": message
             })
             
             # Add your custom message handling logic here
@@ -44,8 +80,10 @@ class PikvmWebSocketClient:
         
         :param data: Parsed message data
         """
-        logging.info(f"Handling status message: {data}")
-        # Add your specific status handling logic here
+        # Публикуем событие о статусе
+        self._emit_event("websocket.status", {
+            "status": data
+        })
 
     def on_error(self, ws, error):
         """
@@ -54,11 +92,10 @@ class PikvmWebSocketClient:
         :param ws: WebSocket connection
         :param error: Error details
         """
-        logging.error(f"WebSocket error: {error}")
-        self.mongodb_handler.save_websocket_event({
-            'source': 'pikvm_websocket',
-            'event_type': 'error',
-            'error_details': str(error)
+        # Публикуем событие об ошибке
+        self._emit_event("websocket.error", {
+            "error": str(error),
+            "error_type": type(error).__name__
         })
         self.reconnect()
 
@@ -70,12 +107,10 @@ class PikvmWebSocketClient:
         :param close_status_code: Status code of closure
         :param close_msg: Closure message
         """
-        logging.warning(f"WebSocket connection closed. Code: {close_status_code}, Message: {close_msg}")
-        self.mongodb_handler.save_websocket_event({
-            'source': 'pikvm_websocket',
-            'event_type': 'connection_close',
-            'status_code': close_status_code,
-            'message': close_msg
+        # Публикуем событие о закрытии соединения
+        self._emit_event("websocket.closed", {
+            "status_code": close_status_code,
+            "message": close_msg
         })
         self.reconnect()
 
@@ -85,13 +120,8 @@ class PikvmWebSocketClient:
         
         :param ws: WebSocket connection
         """
-        logging.info("WebSocket connection established")
-        
-        # Save connection event to MongoDB
-        self.mongodb_handler.save_websocket_event({
-            'source': 'pikvm_websocket',
-            'event_type': 'connection_open'
-        })
+        # Публикуем событие об установке соединения
+        self._emit_event("websocket.connected", {})
         
         # Send initial connection message or status request
         try:

@@ -16,13 +16,21 @@ _http_client: Optional[httpx.AsyncClient] = None
 
 
 def _get_http_client() -> httpx.AsyncClient:
-    """Получить или создать глобальный async HTTP клиент."""
+    """Получить или создать глобальный async HTTP клиент с оптимизациями."""
     global _http_client
     if _http_client is None:
+        # Оптимизация: connection pooling и keep-alive
+        limits = httpx.Limits(
+            max_keepalive_connections=20,  # Максимум keep-alive соединений
+            max_connections=100,  # Максимум одновременных соединений
+            keepalive_expiry=30.0  # Время жизни keep-alive соединения
+        )
         _http_client = httpx.AsyncClient(
-            timeout=30.0,
+            timeout=httpx.Timeout(30.0, connect=10.0),  # Отдельные таймауты для connect и read
             verify=False,  # Dev mode: disable SSL verification
-            follow_redirects=True
+            follow_redirects=True,
+            limits=limits,
+            http2=True  # Поддержка HTTP/2 для лучшей производительности
         )
     return _http_client
 
