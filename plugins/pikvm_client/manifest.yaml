@@ -1,0 +1,18 @@
+id: pikvm_client
+name: PiKVM Client Service
+version: "1.0.0"
+description: Plugin for controlling PiKVM devices via HTTP API and WebSocket
+type: internal
+runtime_mode: in_process
+supported_modes:
+  - in_process
+mode_switch_supported: false
+capabilities:
+  - power_control
+  - gpio_control
+  - msd_management
+  - websocket_monitoring
+required_env:
+  - PIKVM_HOST
+  - PIKVM_USERNAME
+  - PIKVM_PASSWORD

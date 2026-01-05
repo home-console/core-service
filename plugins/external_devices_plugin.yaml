@@ -1,0 +1,18 @@
+id: external_devices
+name: External Devices Manager
+version: "1.0.0"
+description: Manages external smart home devices from PLUGINS_DIR
+author: Home Console Team
+type: internal
+dependencies:
+  - home-console-sdk>=1.0.0
+config_schema:
+  type: object
+  properties:
+    api_key:
+      type: string
+      description: API key for device communication
+    sync_interval:
+      type: integer
+      description: Device sync interval in seconds
+      default: 60

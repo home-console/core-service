@@ -1,0 +1,31 @@
+name: example_plugin
+version: "0.1.0"
+description: MVP example plugin manifest. Demonstrates actions and schemas.
+author: dev
+actions:
+  - id: switch.turn_on
+    canonical: example.switch.turn_on
+    description: Turn on a switch/device
+    schema:
+      type: object
+      properties:
+        device_id:
+          type: string
+      required:
+        - device_id
+  - id: switch.turn_off
+    canonical: example.switch.turn_off
+    description: Turn off a switch/device
+    schema:
+      type: object
+      properties:
+        device_id:
+          type: string
+      required:
+        - device_id
+  - id: probe.status
+    canonical: example.probe.status
+    description: Return example plugin status
+    schema:
+      type: object
+      properties: {}

@@ -1,0 +1,16 @@
+id: client_manager
+name: Client Manager
+version: "1.0.0"
+description: Internal plugin for managing clients, file transfers, and enrollments
+type: internal
+author: Home Console Team
+runtime_mode: microservice
+supported_modes:
+  - in_process
+  - microservice
+mode_switch_supported: true
+infrastructure: true
+external_service:
+  name: client-manager-service
+  default_url: http://client_manager:10000
+  env_var: CM_BASE_URL

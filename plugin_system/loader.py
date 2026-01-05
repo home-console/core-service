@@ -263,23 +263,20 @@ class PluginLoader:
     
     async def _load_external_package(self, package_path: str, package_name: str):
         """Загрузить внешний плагин из папки (package)."""
-        plugin_json_path = os.path.join(package_path, "plugin.json")
-        
-        if not os.path.exists(plugin_json_path):
-            logger.warning(f"⚠️ plugin.json not found in {package_path}")
-            return
-        
         try:
-            metadata = PluginMetadataReader.read_metadata(plugin_json_path)
+            # Попробуем прочитать метаданные (JSON приоритет, затем YAML)
+            metadata = PluginMetadataReader.read_metadata(os.path.join(package_path, "plugin.json"))
             if not metadata:
+                logger.warning(f"⚠️ No valid plugin metadata found in {package_path}")
                 return
-            
+
             entry_file = PluginFinder.find_entry_file(package_path)
             if not entry_file:
+                logger.warning(f"⚠️ Entry file not found in {package_path}")
                 return
-            
+
             await self._load_python_module_file(entry_file, metadata)
-            
+
         except Exception as e:
             logger.error(f"❌ Error loading external package {package_name}: {e}", exc_info=True)
     
@@ -288,14 +285,12 @@ class PluginLoader:
         try:
             base_name = os.path.splitext(os.path.basename(file_path))[0]
             plugin_json_path = os.path.join(os.path.dirname(file_path), f"{base_name}.json")
-            
-            metadata = None
-            if os.path.exists(plugin_json_path):
-                metadata = PluginMetadataReader.read_metadata(plugin_json_path)
-            
+
+            # Попробуем прочитать метаданные рядом с файлом (поддержка YAML)
+            metadata = PluginMetadataReader.read_metadata(plugin_json_path)
             if not metadata:
                 metadata = PluginMetadataReader.create_default_metadata(base_name)
-            
+
             await self._load_python_module_file(file_path, metadata)
             
         except Exception as e:
@@ -308,13 +303,10 @@ class PluginLoader:
             if not extract_dir:
                 return
             
-            plugin_json_path = os.path.join(extract_dir, "plugin.json")
-            if not os.path.exists(plugin_json_path):
-                logger.warning(f"⚠️ plugin.json not found in archive {os.path.basename(archive_path)}")
-                return
-            
-            metadata = PluginMetadataReader.read_metadata(plugin_json_path)
+            # Попробуем найти и прочитать метаданные в распакованной папке
+            metadata = PluginMetadataReader.read_metadata(os.path.join(extract_dir, "plugin.json"))
             if not metadata:
+                logger.warning(f"⚠️ No valid plugin metadata found in archive {os.path.basename(archive_path)}")
                 return
             
             main_file = os.path.join(extract_dir, "main.py")
@@ -483,22 +475,21 @@ class PluginLoader:
             # Подтягиваем сохраненную конфигурацию из БД
             await self._apply_plugin_config(plugin)
             
-            # Пытаемся загрузить manifest.json для встроенных плагинов
+            # Пытаемся загрузить manifest (JSON приоритет, затем YAML) для встроенных плагинов
             if plugin_type == "builtin" and hasattr(module, '__file__'):
                 module_file = module.__file__
                 if module_file:
                     module_dir = os.path.dirname(module_file)
                     manifest_path = os.path.join(module_dir, "manifest.json")
-                    if os.path.exists(manifest_path):
-                        try:
-                            manifest_data = PluginMetadataReader.read_metadata(manifest_path)
-                            if manifest_data:
-                                plugin.manifest = manifest_data
-                                if manifest_data.get('type'):
-                                    plugin.type = manifest_data.get('type')
-                                logger.debug(f"📋 Loaded manifest.json for {plugin.id}")
-                        except Exception as e:
-                            logger.debug(f"⚠️ Failed to load manifest.json for {plugin.id}: {e}")
+                    try:
+                        manifest_data = PluginMetadataReader.read_metadata(manifest_path)
+                        if manifest_data:
+                            plugin.manifest = manifest_data
+                            if manifest_data.get('type'):
+                                plugin.type = manifest_data.get('type')
+                            logger.debug(f"📋 Loaded manifest for {plugin.id} from {manifest_path}")
+                    except Exception as e:
+                        logger.debug(f"⚠️ Failed to load manifest for {plugin.id}: {e}")
             
             # Вызываем on_load
             try:
@@ -781,20 +772,19 @@ class PluginLoader:
             subprocess.check_call(["git", "clone", "--depth", "1", git_url, tmp_clone])
             
             plugin_root = tmp_clone
+            # Попробуем найти метаданные в корне или в единственной вложенной папке
             if not os.path.exists(os.path.join(plugin_root, 'plugin.json')):
                 entries = [e for e in os.listdir(tmp_clone) if not e.startswith('.')]
                 if len(entries) == 1:
                     candidate = os.path.join(tmp_clone, entries[0])
-                    if os.path.exists(os.path.join(candidate, 'plugin.json')):
+                    # позволяем yaml/manifest альтернативы — PluginMetadataReader сам найдёт
+                    if os.path.exists(os.path.join(candidate, 'plugin.json')) or os.path.exists(os.path.join(candidate, 'manifest.json')):
                         plugin_root = candidate
-            
-            plugin_json = os.path.join(plugin_root, 'plugin.json')
-            if not os.path.exists(plugin_json):
-                raise FileNotFoundError('plugin.json not found in cloned repository')
-            
-            metadata = PluginMetadataReader.read_metadata(plugin_json)
+
+            # Читаем метаданные (поддерживает JSON и YAML)
+            metadata = PluginMetadataReader.read_metadata(os.path.join(plugin_root, 'plugin.json'))
             if not metadata:
-                raise ValueError('Invalid plugin.json')
+                raise FileNotFoundError('No valid plugin metadata (plugin.json/manifest.yaml) found in cloned repository')
             
             plugin_id = metadata.get('id') or os.path.basename(git_url).replace('.git', '')
             dest_path = os.path.join(self.external_plugins_dir, plugin_id)

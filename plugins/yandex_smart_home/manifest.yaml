@@ -1,0 +1,26 @@
+id: yandex_smart_home
+name: Yandex Smart Home
+version: "0.3.0"
+description: |
+  Yandex Smart Home and Alice adapter with auth integration - OAuth + device sync + intent mapping + voice commands + secure token management
+type: internal
+runtime_mode: in_process
+supported_modes:
+  - in_process
+  - microservice
+mode_switch_supported: true
+capabilities:
+  - oauth
+  - device_discovery
+  - actions
+  - voice_commands
+  - intents
+  - alice_integration
+  - secure_token_storage
+  - auth_service_integration
+required_env:
+  - YANDEX_CLIENT_ID
+  - YANDEX_CLIENT_SECRET
+  - YANDEX_REDIRECT_URI
+  - AUTH_SERVICE_BASE
+  - INTERNAL_SERVICE_TOKEN
