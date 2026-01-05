@@ -6,14 +6,14 @@ import os
 from typing import Dict, Any
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from sqlalchemy import select
 
 # Terminal audit is now handled by client_manager plugin
 # This route is kept for backward compatibility but will be removed
 try:
-    from ..db import get_session
+    from ..core.database import get_session
     from ..plugins.client_manager.models import TerminalAudit
 except ImportError:
     # Fallback if plugin not loaded
@@ -24,7 +24,7 @@ router = APIRouter()
 
 
 @router.get("/admin/events/logs")
-async def get_event_logs(limit: int = 100, filter: str = None):
+async def get_event_logs(request: Request, limit: int = 100, filter: str = None):
     """
     Получить логи событий из event_bus.
     
@@ -33,7 +33,13 @@ async def get_event_logs(limit: int = 100, filter: str = None):
         filter: Фильтр по имени события (поддерживает wildcards, например "device.*")
     """
     try:
-        from ..event_bus import event_bus
+        from ..core import EventBus
+        # Получаем event_bus из app.state
+        if hasattr(request.app.state, 'event_bus'):
+            event_bus = request.app.state.event_bus
+        else:
+            from ..core import get_event_bus as _get_event_bus
+            event_bus = _get_event_bus(request)
         logs = event_bus.get_logs(limit=limit, event_filter=filter)
         return JSONResponse({
             "status": "ok",
@@ -50,10 +56,16 @@ async def get_event_logs(limit: int = 100, filter: str = None):
 
 
 @router.get("/admin/events/stats")
-async def get_event_stats():
+async def get_event_stats(request: Request):
     """Получить статистику по событиям."""
     try:
-        from ..event_bus import event_bus
+        from ..core import EventBus
+        # Получаем event_bus из app.state
+        if hasattr(request.app.state, 'event_bus'):
+            event_bus = request.app.state.event_bus
+        else:
+            from ..core import get_event_bus as _get_event_bus
+            event_bus = _get_event_bus(request)
         stats = event_bus.get_stats()
         return JSONResponse({
             "status": "ok",
@@ -67,10 +79,16 @@ async def get_event_stats():
 
 
 @router.post("/admin/events/clear")
-async def clear_event_logs():
+async def clear_event_logs(request: Request):
     """Очистить лог событий."""
     try:
-        from ..event_bus import event_bus
+        from ..core import EventBus
+        # Получаем event_bus из app.state
+        if hasattr(request.app.state, 'event_bus'):
+            event_bus = request.app.state.event_bus
+        else:
+            from ..core import get_event_bus as _get_event_bus
+            event_bus = _get_event_bus(request)
         event_bus.clear_log()
         return JSONResponse({
             "status": "ok",

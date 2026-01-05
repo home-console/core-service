@@ -10,8 +10,7 @@ from fastapi import APIRouter, HTTPException, Form
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
-from ..db import get_session
-from ..models import Client, CommandLog
+from ..core.database import get_session
 from ..utils.http_client import _http_json
 from ..utils.auth import get_admin_headers, generate_jwt_token
 

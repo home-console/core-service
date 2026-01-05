@@ -11,11 +11,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from pydantic import BaseModel
 
-from ..db import get_session
-from ..models import Device, PluginBinding, IntentMapping, DeviceLink, User
+from ..core.database import get_session, Device, PluginBinding, IntentMapping, DeviceLink, User
 from ..routes.auth import get_current_user
 from ..utils.cache import cache_get, cache_set, cache_delete_pattern
-from ..dependencies import get_plugin_loader
+from ..core import get_plugin_loader
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -329,7 +328,7 @@ async def _execute_device_action_internal(device_id: str, payload: Dict[str, Any
         # Используем глобальный event_bus для обратной совместимости
         # TODO: Рефакторить _execute_device_action_internal для использования DI через параметр
         try:
-            from ..event_bus import get_event_bus as get_global_event_bus
+            from ..core import get_event_bus as get_global_event_bus
             event_bus = get_global_event_bus()
         except Exception as e:
             logger.warning(f"Could not get event_bus: {e}")

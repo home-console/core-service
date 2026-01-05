@@ -22,15 +22,13 @@ import subprocess
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 
-from .core.base import InternalPluginBase
+from .base.base import InternalPluginBase
 try:
-    from ..event_bus import EventBus
-    from ..models import Device, PluginBinding, IntentMapping, Plugin, PluginVersion
-    from ..db import get_session
+    from ..core import EventBus
+    from ..core.database import Device, PluginBinding, IntentMapping, Plugin, PluginVersion, get_session
 except ImportError:
-    from core_service.event_bus import EventBus
-    from core_service.models import Device, PluginBinding, IntentMapping, Plugin, PluginVersion
-    from core_service.db import get_session
+    from core_service.core import EventBus
+    from core_service.core.database import Device, PluginBinding, IntentMapping, Plugin, PluginVersion, get_session
 
 from .plugin_finder import PluginFinder
 from .metadata_reader import PluginMetadataReader

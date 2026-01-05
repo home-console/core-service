@@ -2,7 +2,7 @@
 Plugin System - модульная система управления плагинами.
 
 Структура:
-- core/ - базовые классы (base.py)
+- base/ - базовые классы (base.py)
 - managers/ - менеджеры (config, dependency, lifecycle, mode, security)
 - loader.py - основная логика загрузки плагинов
 - registry.py - реестр внешних плагинов
@@ -15,7 +15,7 @@ Plugin System - модульная система управления плаг�
 """
 
 from .loader import PluginLoader
-from .core import InternalPluginBase
+from .base import InternalPluginBase
 from .registry import external_plugin_registry, ExternalPlugin, ExternalPluginRegistry
 from .managers import (
     PluginConfigManager,

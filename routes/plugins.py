@@ -13,14 +13,13 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from typing import Optional
 
-from ..db import get_session
-from ..models import Plugin, PluginVersion, PluginInstallJob
+from ..core.database import get_session, Plugin, PluginVersion, PluginInstallJob
 from ..utils.http_client import _http_json
 from ..utils.auth import generate_jwt_token
 from ..plugin_system.registry import external_plugin_registry
-from ..dependencies import get_plugin_loader, get_event_bus
+from ..core import get_plugin_loader, get_event_bus
 from ..plugin_system.loader import PluginLoader
-from ..event_bus import EventBus
+from ..core import EventBus
 
 import logging
 import uuid

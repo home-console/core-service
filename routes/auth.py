@@ -16,8 +16,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from ..db import get_session
-from ..models import User, Plugin, PluginVersion
+from ..core.database import get_session, User, Plugin, PluginVersion
 from ..utils.auth import verify_password, hash_password
 
 
@@ -293,7 +292,7 @@ async def sync_yandex_devices(user_id: str, access_token: str):
             devices = devices_data.get('devices', [])
 
             # Import Device model and PluginBinding to sync devices
-            from ..models import Device, PluginBinding
+            from ..core.database import Device, PluginBinding
             from sqlalchemy import select
 
             async with get_session() as db:

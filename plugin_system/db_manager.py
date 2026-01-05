@@ -8,11 +8,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 try:
-    from ..models import Plugin, PluginVersion
-    from ..db import get_session
+    from ..core.database import Plugin, PluginVersion, get_session
 except ImportError:
-    from core_service.models import Plugin, PluginVersion
-    from core_service.db import get_session
+    from core_service.core.database import Plugin, PluginVersion, get_session
 
 logger = logging.getLogger(__name__)
 

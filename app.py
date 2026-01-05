@@ -63,8 +63,7 @@ from sqlalchemy import text
 # Relative imports - try relative first, then absolute with package prefix
 logger.debug("Importing core modules")
 try:
-    from .db import engine, get_session, AsyncSessionLocal
-    from .models import Base
+    from .core.database import engine, get_session, AsyncSessionLocal, Base
     from .plugin_system import PluginLoader
     from .plugin_system.registry import external_plugin_registry
     from .plugin_system.managers import (
@@ -74,7 +73,7 @@ try:
         init_plugin_security_manager,
         init_plugin_dependency_manager,
     )
-    from .health_monitor import HealthMonitor
+    from .core import HealthMonitor
     logger.debug("Core modules imported")
 except ImportError as e:
     logger.error(f"Failed to import core modules: {e}", exc_info=True)
@@ -113,12 +112,12 @@ User = None
 
 logger.debug("Importing core models")
 try:
-    from .models import Device, PluginBinding, IntentMapping, DeviceLink, Plugin, PluginVersion, PluginInstallJob, User
+    from .core.database import Device, PluginBinding, IntentMapping, DeviceLink, Plugin, PluginVersion, PluginInstallJob, User
     logger.debug("Core models imported")
 except ImportError as e:
     logger.warning(f"Failed to import core models: {e}")
     try:
-        from core_service.models import Device, PluginBinding, IntentMapping, DeviceLink, Plugin, PluginVersion, PluginInstallJob, User
+        from core_service.core.database import Device, PluginBinding, IntentMapping, DeviceLink, Plugin, PluginVersion, PluginInstallJob, User
         logger.debug("Core models imported (absolute)")
     except ImportError:
         # If models can't be imported, leave as None; admin views will be skipped
@@ -352,7 +351,7 @@ async def lifespan(app: FastAPI):
         logger.info("🔌 Loading plugins...")
         try:
             # Создаем event_bus здесь, а не используем глобальный singleton
-            from .event_bus import EventBus
+            from .core import EventBus
             event_bus = EventBus()
             
             import asyncio
